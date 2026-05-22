@@ -1,0 +1,9 @@
+pytest>=8
+matplotlib>=3.7
+# Phase-1 benchmark loaders
+evalplus>=0.3
+datasets>=2.18
+# Phase-2 (repo-level + shell) benchmark loaders. Require Docker.
+swebench>=4.1
+terminal-bench>=0.2
+pyyaml>=6
