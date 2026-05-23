@@ -11,15 +11,22 @@ comes from execution feedback vs raw one-shot model intelligence.
 | B    | model-written      | no        | "test thinking" alone             |
 | C    | public (reliable)  | yes       | feedback use with reliable tests  |
 | D    | model-written      | yes       | full self-loop (the hypothesis)   |
+| D_sep| model-written      | yes       | solution first, tests second      |
+| D_dual | model-written    | yes       | code model + test model           |
+| D_val | validated model-written | yes   | code model + test model + validator + optional reference oracle |
 | E    | public + model     | yes       | practical ceiling                 |
 
-A and B run with `k=1` (no iteration). C/D/E iterate up to `k`.
+A and B run with `k=1` (no iteration). C/D/D_sep/D_dual/D_val/E iterate up to `k`.
 
 ## Key decomposition
 ```
 C - A = execution-feedback value (with reliable tests)
 D - A = self-loop value
+D_sep - A = separated self-loop value
+D_dual - A = two-model self-loop value
+D_val - A = validated self-loop value
 C - D = test-writing weakness
+D_val - D_dual = test-validation value
 E - C = marginal value of model-written tests on top of public
 ```
 
@@ -31,6 +38,7 @@ tasks/
     solution.py         # starter the model edits
     public_tests.py     # visible feedback (modes C, E)
     hidden_tests.py     # final scoring only — never enters the sandbox
+    reference_solution.py # optional trusted oracle for validating self_tests.py
   ...
 harness/
   sandbox.py            # tempdir + subprocess pytest
@@ -51,6 +59,9 @@ saves PNGs to `results/plots/<batch_tag>/`:
 - `pass_rate_by_mode_k.png` — bar chart, hidden pass rate per (mode, k)
 - `baseline_vs_tests.png` — headline comparison: no tests (A/k=1) vs public-test feedback (C/k=max)
 - `baseline_vs_self_tests.png` — headline comparison: no tests (A/k=1) vs model-written self-test loop (D/k=max)
+- `baseline_vs_separate_self_tests.png` — headline comparison: no tests (A/k=1) vs separated self-test loop (D_sep/k=max)
+- `baseline_vs_dual_self_tests.png` — headline comparison: no tests (A/k=1) vs two-model self-test loop (D_dual/k=max)
+- `baseline_vs_validated_self_tests.png` — headline comparison: no tests (A/k=1) vs validated self-test loop (D_val/k=max)
 - `pass_rate_vs_iterations.png` — k-sweep line plot
 - `repair_outcomes.png` — when `--score-hidden-each-iter` is enabled, counts hidden-fail→hidden-pass repairs
 - `overfit_rate_by_mode.png` — visible pass + hidden fail (kill metric)
@@ -110,8 +121,10 @@ python run.py --model qwen2.5-coder:1.5b --benchmark humaneval_plus --modes A,C 
 # positive temperature when you want seed-to-seed variation.
 python run.py \
   --model qwen2.5-coder:7b \
+  --test-model qwen2.5-coder:7b \
+  --validator-model gemma4:e2b \
   --benchmark humaneval_plus \
-  --modes A,D \
+  --modes A,D,D_sep,D_dual,D_val \
   --ks 1,3,5 \
   --limit 164 \
   --hidden-timeout 120 \
@@ -119,6 +132,36 @@ python run.py \
   --temperature 0.2 \
   --seeds 1,2,3,4,5 \
   --batch-tag humaneval_plus_repair_qwen7b_full
+
+# Two-model self-test agent only:
+# code model writes and repairs solution.py; test model writes frozen self_tests.py.
+python run.py \
+  --model qwen2.5-coder:7b \
+  --test-model qwen2.5-coder:7b \
+  --benchmark humaneval_plus \
+  --modes A,D_dual \
+  --ks 1,3 \
+  --limit 20 \
+  --hidden-timeout 120 \
+  --score-hidden-each-iter \
+  --batch-tag humaneval_plus_dual_qwen7b_test7b_20
+
+# Validated self-test agent:
+# code model writes/repairs solution.py; test model writes self_tests.py;
+# validator model rejects weak or invalid tests before execution.
+# If reference_solution.py exists, D_val also runs self_tests.py against it
+# and rejects tests with wrong expected values.
+python run.py \
+  --model qwen2.5-coder:7b \
+  --test-model qwen2.5-coder:7b \
+  --validator-model gemma4:e2b \
+  --benchmark humaneval_plus \
+  --modes A,D_val \
+  --ks 1,3 \
+  --limit 20 \
+  --hidden-timeout 120 \
+  --score-hidden-each-iter \
+  --batch-tag humaneval_plus_validated_qwen7b_test7b_gemma_validator_20
 
 # LiveCodeBench — pick problems after the model's likely training cutoff
 python -m harness.load_benchmark --name livecodebench --since 2024-06-01 --difficulty easy --limit 50
@@ -197,10 +240,11 @@ is the next milestone.
 - visible public/self pytest timeout: 10s (`--pytest-timeout`)
 - final hidden benchmark scoring timeout: 60s (`--hidden-timeout`)
 - optional per-iteration hidden scoring for repair analysis: `--score-hidden-each-iter` (never shown to the model)
+- dual/validated skill files: `agent_skills/code_writer/skills.md`, `agent_skills/test_writer/skills.md`, and `agent_skills/test_validator/skills.md`
 - temperature: 0
 - model sampling seed: 0 by default (`--seed` or repeated with `--seeds`)
 - max output tokens per call: 4096
 
 ## Gate
 If `C(k=5) - A(k=1) >= 15 percentage points` over the pilot set, expand to
-modes D + E and scale to more tasks / model sizes.
+modes D/D_sep/D_dual/D_val + E and scale to more tasks / model sizes.

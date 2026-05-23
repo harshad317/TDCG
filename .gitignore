@@ -5,4 +5,5 @@ __pycache__/
 .claude/
 results/*.jsonl
 results/plots/
+results/artifacts/
 tasks_bench/

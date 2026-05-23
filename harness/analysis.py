@@ -29,7 +29,7 @@ def self_test_confusion(rows: list[dict]) -> dict[str, Any]:
     by_mode_k: dict[str, dict[str, int]] = defaultdict(lambda: {key: 0 for key in counts})
 
     for row in rows:
-        if row.get("mode") not in ("D", "E"):
+        if row.get("mode") not in ("D", "D_sep", "D_dual", "D_val", "E"):
             continue
         label = f"{row['mode']}/k={row['k']}"
         self_passed = row.get("passed_self")
@@ -75,7 +75,7 @@ def paired_ablation(rows: list[dict]) -> dict[str, Any]:
     compared_rows = [
         row
         for row in scored
-        if row.get("mode") in ("C", "D", "E")
+        if row.get("mode") in ("C", "D", "D_sep", "D_dual", "D_val", "E")
     ]
     for row in compared_rows:
         base = baseline.get(_row_key(row))
@@ -134,7 +134,7 @@ def repair_counts(rows: list[dict]) -> dict[str, int]:
         extra = row.get("extra") or {}
         if extra.get("score_hidden_each_iter") is not True:
             continue
-        if row.get("mode") not in ("D", "E"):
+        if row.get("mode") not in ("D", "D_sep", "D_dual", "D_val", "E"):
             continue
         initial = extra.get("initial_hidden_pass")
         final = row.get("passed_hidden")

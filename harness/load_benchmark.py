@@ -6,7 +6,8 @@ Supports:
   mbpp_san  — 427-problem sanitized subset
 
 After running, each problem becomes a directory under tasks_bench/<bench>/
-containing prompt.md, solution.py, public_tests.py, hidden_tests.py — fully
+containing prompt.md, solution.py, public_tests.py, hidden_tests.py, and
+reference_solution.py when the benchmark ships a canonical solution — fully
 compatible with run.py.
 
 Usage:
@@ -166,6 +167,7 @@ def materialize_humaneval(out_root: Path, limit: int | None = None) -> int:
         (task_dir / "solution.py").write_text(starter)
         (task_dir / "public_tests.py").write_text(pub_tests)
         (task_dir / "hidden_tests.py").write_text(hid_tests)
+        (task_dir / "reference_solution.py").write_text(p["prompt"] + p["canonical_solution"])
         n += 1
     return n
 
@@ -279,6 +281,7 @@ def _materialize_mbpp_records(records: list[dict], out_root: Path, limit: int | 
         (task_dir / "solution.py").write_text(starter)
         (task_dir / "public_tests.py").write_text(pub_tests)
         (task_dir / "hidden_tests.py").write_text(hid_tests)
+        (task_dir / "reference_solution.py").write_text(code)
         n += 1
     return n
 
@@ -373,6 +376,7 @@ def _materialize_evalplus(out_root: Path, kind: str, limit: int | None) -> int:
         (task_dir / "solution.py").write_text(starter)
         (task_dir / "public_tests.py").write_text(pub_src)
         (task_dir / "hidden_tests.py").write_text(hid_src)
+        (task_dir / "reference_solution.py").write_text(canonical_module)
         n += 1
 
     if skipped:
@@ -714,6 +718,9 @@ def materialize_bigcodebench(out_root: Path, limit: int | None = None, hard: boo
         (task_dir / "solution.py").write_text(starter)
         (task_dir / "public_tests.py").write_text(pub_src)
         (task_dir / "hidden_tests.py").write_text(hid_src)
+        canonical_solution = r.get("canonical_solution")
+        if canonical_solution:
+            (task_dir / "reference_solution.py").write_text(prompt + canonical_solution)
         n += 1
     if skipped:
         print(f"  skipped {skipped} tasks (could not extract first test method)")

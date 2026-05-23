@@ -6,12 +6,15 @@ Plots produced (only those that have data):
   1. pass_rate_by_mode_k.png        — bar chart, pass@1 on hidden tests per (mode, k)
   2. baseline_vs_tests.png          — no tests (A) vs public-test feedback (C)
   3. baseline_vs_self_tests.png     — no tests (A) vs model-written tests (D)
-  4. pass_rate_vs_iterations.png    — line plot, k-sweep for exec modes
-  5. repair_outcomes.png            — hidden-fail to hidden-pass after self-test feedback
-  6. overfit_rate_by_mode.png       — visible-pass-but-hidden-fail rate per (mode, k)
-  7. tokens_vs_pass.png             — scatter, output tokens vs hidden pass
-  8. delta_by_model_size.png        — only when multiple models present
-  9. per_task_heatmap.png           — task x mode_k grid of pass/fail
+  4. baseline_vs_separate_self_tests.png — no tests (A) vs separated self-test loop (D_sep)
+  5. baseline_vs_dual_self_tests.png — no tests (A) vs two-model self-test loop (D_dual)
+  6. baseline_vs_validated_self_tests.png — no tests (A) vs validated self-test loop (D_val)
+  7. pass_rate_vs_iterations.png    — line plot, k-sweep for exec modes
+  8. repair_outcomes.png            — hidden-fail to hidden-pass after self-test feedback
+  9. overfit_rate_by_mode.png       — visible-pass-but-hidden-fail rate per (mode, k)
+  10. tokens_vs_pass.png             — scatter, output tokens vs hidden pass
+  11. delta_by_model_size.png       — only when multiple models present
+  12. per_task_heatmap.png          — task x mode_k grid of pass/fail
 """
 from __future__ import annotations
 
@@ -199,6 +202,45 @@ def plot_baseline_vs_self_tests(rows: list[dict], out_path: Path) -> None:
     )
 
 
+def plot_baseline_vs_separate_self_tests(rows: list[dict], out_path: Path) -> None:
+    """Headline chart for separated self-tests: Mode A/k=1 vs Mode D_sep/k=max."""
+    _plot_baseline_vs_mode(
+        rows=rows,
+        out_path=out_path,
+        compared_mode="D_sep",
+        compared_label="With separate self-tests",
+        compared_detail="D_sep/k=max",
+        title="No tests vs separated self-test loop",
+        color="#14b8a6",
+    )
+
+
+def plot_baseline_vs_dual_self_tests(rows: list[dict], out_path: Path) -> None:
+    """Headline chart for two-model self-tests: Mode A/k=1 vs Mode D_dual/k=max."""
+    _plot_baseline_vs_mode(
+        rows=rows,
+        out_path=out_path,
+        compared_mode="D_dual",
+        compared_label="With dual self-tests",
+        compared_detail="D_dual/k=max",
+        title="No tests vs two-model self-test loop",
+        color="#0f766e",
+    )
+
+
+def plot_baseline_vs_validated_self_tests(rows: list[dict], out_path: Path) -> None:
+    """Headline chart for validated self-tests: Mode A/k=1 vs Mode D_val/k=max."""
+    _plot_baseline_vs_mode(
+        rows=rows,
+        out_path=out_path,
+        compared_mode="D_val",
+        compared_label="With validated self-tests",
+        compared_detail="D_val/k=max",
+        title="No tests vs validated self-test loop",
+        color="#15803d",
+    )
+
+
 def _plot_baseline_vs_mode(
     rows: list[dict],
     out_path: Path,
@@ -296,7 +338,16 @@ def plot_pass_rate_vs_iterations(rows: list[dict], out_path: Path) -> None:
     if not by_mode:
         return
     fig, ax = plt.subplots(figsize=(7, 4))
-    colors = {"A": "#94a3b8", "B": "#f59e0b", "C": "#3b82f6", "D": "#10b981", "E": "#a855f7"}
+    colors = {
+        "A": "#94a3b8",
+        "B": "#f59e0b",
+        "C": "#3b82f6",
+        "D": "#10b981",
+        "D_sep": "#14b8a6",
+        "D_dual": "#0f766e",
+        "D_val": "#15803d",
+        "E": "#a855f7",
+    }
     for mode, pts in sorted(by_mode.items()):
         pts.sort()
         xs = [p[0] for p in pts]
@@ -317,7 +368,7 @@ def _repair_bucket(row: dict) -> str | None:
     extra = row.get("extra") or {}
     if extra.get("score_hidden_each_iter") is not True:
         return None
-    if row.get("mode") not in ("D", "E"):
+    if row.get("mode") not in ("D", "D_sep", "D_dual", "D_val", "E"):
         return None
     initial = extra.get("initial_hidden_pass")
     final = row.get("passed_hidden")
@@ -410,7 +461,7 @@ def _row_visible_passed(row: dict) -> bool:
     required = []
     if mode in ("C", "E"):
         required.append(row.get("passed_public"))
-    if mode in ("D", "E"):
+    if mode in ("D", "D_sep", "D_dual", "D_val", "E"):
         required.append(row.get("passed_self"))
     return bool(required) and all(value is True for value in required)
 
@@ -455,7 +506,7 @@ def plot_delta_by_model_size(rows: list[dict], out_path: Path) -> None:
     if len(models) < 2:
         return
     fig, ax = plt.subplots(figsize=(7, 4))
-    for mode in ["C", "D", "E"]:
+    for mode in ["C", "D", "D_sep", "D_dual", "D_val", "E"]:
         xs, ys = [], []
         for m in models:
             sub = [r for r in rows if r["model"] == m]
@@ -538,6 +589,9 @@ def make_all(
         ("pass_rate_by_mode_k.png", plot_pass_rate_by_mode_k),
         ("baseline_vs_tests.png", plot_baseline_vs_tests),
         ("baseline_vs_self_tests.png", plot_baseline_vs_self_tests),
+        ("baseline_vs_separate_self_tests.png", plot_baseline_vs_separate_self_tests),
+        ("baseline_vs_dual_self_tests.png", plot_baseline_vs_dual_self_tests),
+        ("baseline_vs_validated_self_tests.png", plot_baseline_vs_validated_self_tests),
         ("pass_rate_vs_iterations.png", plot_pass_rate_vs_iterations),
         ("repair_outcomes.png", plot_repair_outcomes),
         ("overfit_rate_by_mode.png", plot_overfit_rate),

@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,7 +77,7 @@ class Sandbox:
 
     def run_pytest(self, test_file: str, timeout: int = DEFAULT_CMD_TIMEOUT) -> RunResult:
         return self.run(
-            ["python", "-m", "pytest", "-q", "--no-header", "--tb=short", test_file],
+            [sys.executable, "-m", "pytest", "-q", "--no-header", "--tb=short", test_file],
             timeout=timeout,
         )
 
@@ -95,7 +96,52 @@ def score_hidden(task_dir: Path, sandbox: Sandbox, timeout: int = DEFAULT_CMD_TI
         shutil.copy2(sandbox.tmp / "solution.py", score_dir / "solution.py")
         shutil.copy2(task_dir / "hidden_tests.py", score_dir / "hidden_tests.py")
         proc = subprocess.run(
-            ["python", "-m", "pytest", "-q", "--no-header", "--tb=short", "hidden_tests.py"],
+            [sys.executable, "-m", "pytest", "-q", "--no-header", "--tb=short", "hidden_tests.py"],
+            cwd=score_dir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={
+                **os.environ,
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONINTMAXSTRDIGITS": "1000000",
+                "PYTHONHASHSEED": "0",
+            },
+        )
+        return RunResult(proc.returncode, proc.stdout, proc.stderr, False)
+    except subprocess.TimeoutExpired as e:
+        return RunResult(
+            returncode=124,
+            stdout=(e.stdout or b"").decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or ""),
+            stderr=(e.stderr or b"").decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or ""),
+            timed_out=True,
+        )
+    finally:
+        shutil.rmtree(score_dir, ignore_errors=True)
+
+
+def score_self_tests_on_reference(
+    task_dir: Path,
+    sandbox: Sandbox,
+    timeout: int = DEFAULT_CMD_TIMEOUT,
+) -> RunResult | None:
+    """Run generated self_tests.py against a trusted reference solution if present.
+
+    reference_solution.py is never copied into the model-visible sandbox. The
+    harness uses it only as a private oracle to reject self-tests with incorrect
+    expected values.
+    """
+    reference = task_dir / "reference_solution.py"
+    self_tests = sandbox.tmp / "self_tests.py"
+    if not reference.exists() or not self_tests.exists():
+        return None
+
+    score_dir = Path(tempfile.mkdtemp(prefix="codehyp_ref_"))
+    try:
+        shutil.copy2(reference, score_dir / "solution.py")
+        shutil.copy2(self_tests, score_dir / "self_tests.py")
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "--no-header", "--tb=short", "self_tests.py"],
             cwd=score_dir,
             capture_output=True,
             text=True,

@@ -52,9 +52,11 @@ def fmt_status(value: bool | None) -> str:
 
 
 def fmt_self_status(record: RunRecord) -> str:
-    if record.mode in ("D", "E") and record.extra.get("self_tests_present") is False:
+    if record.mode == "D_val" and record.extra.get("self_tests_validated") is False:
+        return "INVALID"
+    if record.mode in ("D", "D_sep", "D_dual", "D_val", "E") and record.extra.get("self_tests_present") is False:
         return "MISSING"
-    if record.mode in ("D", "E") and record.extra.get("ran_self_tests") is False:
+    if record.mode in ("D", "D_sep", "D_dual", "D_val", "E") and record.extra.get("ran_self_tests") is False:
         return "NOT_RUN"
     return fmt_status(record.passed_self)
 
@@ -81,7 +83,11 @@ def fmt_repair_status(record: RunRecord) -> str:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--model", required=True, help="Ollama model id, e.g. qwen2.5-coder:1.5b")
+    p.add_argument("--model", required=True, help="code model id, e.g. qwen2.5-coder:1.5b")
+    p.add_argument("--test-model", default=None,
+                   help="test-writing model id; required for modes D_dual and D_val")
+    p.add_argument("--validator-model", default=None,
+                   help="test-validation model id; defaults to --test-model for mode D_val")
     p.add_argument("--backend", default="ollama")
     p.add_argument("--tasks", nargs="*", default=[], help="task directories")
     p.add_argument("--all", action="store_true", help="run every task under tasks/")
@@ -92,7 +98,7 @@ def main() -> int:
     p.add_argument("--bench-root", default="tasks_bench")
     p.add_argument("--limit", type=int, default=None,
                    help="only run the first N tasks (after sorting)")
-    p.add_argument("--modes", default="A,C", help="comma-separated modes: A,B,C,D,E")
+    p.add_argument("--modes", default="A,C", help="comma-separated modes: A,B,C,D,D_sep,D_dual,D_val,E")
     p.add_argument("--ks", default="1,3,5", help="comma-separated k values; A/B forced to k=1")
     p.add_argument("--max-bash-calls", type=int, default=10)
     p.add_argument("--pytest-timeout", type=int, default=10,
@@ -101,6 +107,16 @@ def main() -> int:
                    help="timeout for final hidden benchmark scoring")
     p.add_argument("--score-hidden-each-iter", action="store_true",
                    help="silently score hidden tests after each iteration for repair-causality analysis; never shown to the model")
+    p.add_argument("--save-artifacts", action="store_true",
+                   help="save per-iteration solution.py, self_tests.py, and pytest outputs for debugging")
+    p.add_argument("--artifact-root", default="results/artifacts",
+                   help="root directory for --save-artifacts output")
+    p.add_argument("--code-skill", default="agent_skills/code_writer/skills.md",
+                   help="skill markdown used by the code-writing model in D_dual/D_val")
+    p.add_argument("--test-skill", default="agent_skills/test_writer/skills.md",
+                   help="skill markdown used by the test-writing model in D_dual/D_val")
+    p.add_argument("--validator-skill", default="agent_skills/test_validator/skills.md",
+                   help="skill markdown used by the test-validation model in D_val")
     p.add_argument("--max-tokens", type=int, default=4096)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0,
@@ -125,6 +141,9 @@ def main() -> int:
     modes = parse_csv_str(args.modes)
     ks = parse_csv_ints(args.ks)
     seeds = parse_csv_ints(args.seeds) if args.seeds else [args.seed]
+    if any(mode in modes for mode in ("D_dual", "D_val")) and not args.test_model:
+        raise SystemExit("--test-model is required when using mode D_dual or D_val")
+    validator_model = args.validator_model or args.test_model
 
     logger = JsonlLogger(Path(args.log))
 
@@ -137,6 +156,24 @@ def main() -> int:
             max_tokens=args.max_tokens,
             seed=seed,
         )
+        test_client = None
+        if args.test_model:
+            test_client = build_client(
+                args.test_model,
+                backend=args.backend,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                seed=seed,
+            )
+        validator_client = None
+        if validator_model:
+            validator_client = build_client(
+                validator_model,
+                backend=args.backend,
+                temperature=args.temperature,
+                max_tokens=args.max_tokens,
+                seed=seed,
+            )
         for task_dir in tasks:
             for mode in modes:
                 mode_ks = [1] if mode in ("A", "B") else ks
@@ -150,6 +187,10 @@ def main() -> int:
                         seed=seed,
                     )
                     record.extra["batch_tag"] = batch_tag
+                    if mode in ("D_dual", "D_val"):
+                        record.extra["test_model"] = args.test_model
+                    if mode == "D_val":
+                        record.extra["validator_model"] = validator_model
                     print(
                         f"[{total}] seed={seed} task={task_dir.name} mode={mode} k={k} ... ",
                         end="",
@@ -167,9 +208,24 @@ def main() -> int:
                         pytest_timeout=args.pytest_timeout,
                         hidden_timeout=args.hidden_timeout,
                         score_hidden_each_iter=args.score_hidden_each_iter,
+                        code_skill_path=Path(args.code_skill),
+                        test_skill_path=Path(args.test_skill),
+                        validator_skill_path=Path(args.validator_skill),
+                        artifact_root=(
+                            Path(args.artifact_root) / batch_tag
+                            if args.save_artifacts
+                            else None
+                        ),
                     )
                     try:
-                        run_task(client, task_dir, cfg, record)
+                        run_task(
+                            client,
+                            task_dir,
+                            cfg,
+                            record,
+                            test_client=test_client,
+                            validator_client=validator_client,
+                        )
                     except Exception as e:
                         record.final_error_type = f"harness_error:{type(e).__name__}:{e}"
                     logger.write(record)
