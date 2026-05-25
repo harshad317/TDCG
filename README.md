@@ -1,4 +1,4 @@
-# TDCG - Test Driven Code Hypothesis
+# TDCG - Test Driven Code Generation
 ## Coding Hypothesis — Test-Repair Loop Ablation
 
 Hypothesis: small coding models become much more effective when wrapped in a
