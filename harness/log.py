@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -30,11 +31,13 @@ class RunRecord:
 class JsonlLogger:
     def __init__(self, path: Path):
         self.path = Path(path)
+        self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, record: RunRecord) -> None:
-        with self.path.open("a") as f:
-            f.write(json.dumps(asdict(record)) + "\n")
+        with self._lock:
+            with self.path.open("a") as f:
+                f.write(json.dumps(asdict(record)) + "\n")
 
 
 def now() -> float:

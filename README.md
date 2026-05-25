@@ -163,6 +163,63 @@ python run.py \
   --score-hidden-each-iter \
   --batch-tag humaneval_plus_validated_qwen7b_test7b_gemma_validator_20
 
+# Longer full-validation runs can parallelize independent cases and raise the
+# Ollama HTTP timeout separately from pytest hidden-test timeout.
+python run.py \
+  --model qwen2.5-coder:7b \
+  --test-model qwen2.5-coder:7b \
+  --validator-model gemma4:e2b \
+  --repair-model gemma4:e2b \
+  --benchmark humaneval_plus \
+  --modes A,C,D_val \
+  --ks 3 \
+  --hidden-timeout 360 \
+  --model-timeout 600 \
+  --repair-model-timeout 240 \
+  --jobs 8 \
+  --score-hidden-each-iter \
+  --save-artifacts \
+  --self-test-candidates 3 \
+  --code-candidates 2 \
+  --repair-candidates 3 \
+  --max-bash-calls 40 \
+  --log results/humaneval_plus_full_v3.jsonl \
+  --batch-tag humaneval_plus_full_v3 \
+  --resume
+
+# Cheaper D_val profile for cost/timeout-control experiments. This keeps the
+# same A/C/D_val comparison shape but uses one self-test suite, one code
+# candidate, one repair candidate, max 12 bash calls, and 180s repair timeout.
+python run.py \
+  --model qwen2.5-coder:7b \
+  --test-model qwen2.5-coder:7b \
+  --validator-model gemma4:e2b \
+  --repair-model gemma4:e2b \
+  --benchmark humaneval_plus \
+  --modes A,C,D_val \
+  --ks 3 \
+  --hidden-timeout 360 \
+  --model-timeout 600 \
+  --jobs 8 \
+  --score-hidden-each-iter \
+  --cheap-dval \
+  --log results/humaneval_plus_cheap_dval_v1.jsonl \
+  --batch-tag humaneval_plus_cheap_dval_v1 \
+  --resume
+
+# Portfolio selector: choose between completed C/k=3 and D_val/k=3 artifacts
+# using only visible signals, then score the selected solution as P_select.
+python -m harness.portfolio_select \
+  --log results/humaneval_plus_full_v3.jsonl \
+  --batch-tag humaneval_plus_full_v3 \
+  --out-log results/humaneval_plus_full_v3_portfolio.jsonl \
+  --out-batch-tag humaneval_plus_full_v3_portfolio \
+  --benchmark humaneval_plus \
+  --score-policy rescore \
+  --hidden-timeout 360 \
+  --save-artifacts \
+  --resume
+
 # LiveCodeBench — pick problems after the model's likely training cutoff
 python -m harness.load_benchmark --name livecodebench --since 2024-06-01 --difficulty easy --limit 50
 python run.py --model qwen2.5-coder:1.5b --benchmark livecodebench --modes A,C --ks 1,3,5
@@ -236,9 +293,15 @@ is the next milestone.
 
 ## Budget (locked, equal across modes)
 - max iterations: from `--ks`
-- max bash calls per run: 10
+- max bash calls per run: 20 by default (`--max-bash-calls`)
 - visible public/self pytest timeout: 10s (`--pytest-timeout`)
 - final hidden benchmark scoring timeout: 60s (`--hidden-timeout`)
+- model HTTP request timeout: 120s (`--model-timeout`)
+- optional repair-only HTTP timeout: defaults to `--model-timeout`, override with `--repair-model-timeout`
+- repair model errors are fail-fast by default and preserve the current solution; use `--continue-repair-after-model-error` to keep trying
+- cheap validated profile: `--cheap-dval`
+- visible-only portfolio selector: `python -m harness.portfolio_select`
+- parallel independent cases: 1 worker (`--jobs`)
 - optional per-iteration hidden scoring for repair analysis: `--score-hidden-each-iter` (never shown to the model)
 - dual/validated skill files: `agent_skills/code_writer/skills.md`, `agent_skills/test_writer/skills.md`, and `agent_skills/test_validator/skills.md`
 - temperature: 0

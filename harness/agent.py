@@ -12,6 +12,8 @@ Mode capabilities (from final-final plan):
 """
 from __future__ import annotations
 
+import ast
+import copy
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,13 +25,18 @@ from .sandbox import RunResult, Sandbox, score_hidden, score_self_tests_on_refer
 
 
 MODES = {"A", "B", "C", "D", "D_sep", "D_dual", "D_val", "E"}
-MAX_BASH_CALLS = 10
+MAX_BASH_CALLS = 20
+DEFAULT_REPAIR_CANDIDATES = 3
 SELF_TEST_MODES = {"B", "D", "D_sep", "D_dual", "D_val", "E"}
 EXEC_SELF_TEST_MODES = {"D", "D_sep", "D_dual", "D_val", "E"}
 DEFAULT_CODE_SKILL_PATH = Path("agent_skills/code_writer/skills.md")
 DEFAULT_TEST_SKILL_PATH = Path("agent_skills/test_writer/skills.md")
 DEFAULT_VALIDATOR_SKILL_PATH = Path("agent_skills/test_validator/skills.md")
 MAX_TEST_VALIDATION_ATTEMPTS = 2
+MAX_UNCHANGED_REPAIR_ESCALATIONS = 2
+DEFAULT_SELF_TEST_CANDIDATES = 1
+DEFAULT_CODE_CANDIDATES = 1
+DEFAULT_ABORT_REPAIR_ON_MODEL_ERROR = True
 
 CODE_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
 
@@ -46,6 +53,10 @@ class AgentConfig:
     test_skill_path: Path = DEFAULT_TEST_SKILL_PATH
     validator_skill_path: Path = DEFAULT_VALIDATOR_SKILL_PATH
     artifact_root: Optional[Path] = None
+    repair_candidates: int = DEFAULT_REPAIR_CANDIDATES
+    self_test_candidates: int = DEFAULT_SELF_TEST_CANDIDATES
+    code_candidates: int = DEFAULT_CODE_CANDIDATES
+    abort_repair_on_model_error: bool = DEFAULT_ABORT_REPAIR_ON_MODEL_ERROR
 
 
 @dataclass
@@ -112,6 +123,9 @@ def initial_user_prompt(prompt_md: str, starter: str, mode: str, public_tests: O
             "",
             "Produce solution.py. After each version, the harness will run public_tests.py "
             "and feed you the result. Iterate until tests pass or budget runs out.",
+            "Treat public_tests.py as a basic smoke suite only. Passing it is not proof "
+            "the implementation is correct; the final answer must satisfy the full task "
+            "docstring, examples, and edge cases.",
         ]
     elif mode == "D":
         parts += [
@@ -180,6 +194,32 @@ def dual_code_initial_prompt(prompt_md: str, starter: str) -> str:
     )
 
 
+def dual_code_candidate_prompt(
+    prompt_md: str,
+    starter: str,
+    candidate_index: int,
+    strategy: str,
+) -> str:
+    return "\n".join(
+        [
+            f"Independent code candidate #{candidate_index}.",
+            f"Strategy: {strategy}.",
+            "Write the best final solution.py for the task. Do not write tests.",
+            "Use a materially independent implementation, not a paraphrase of another candidate.",
+            "",
+            "Task description:",
+            prompt_md.strip(),
+            "",
+            "Current solution.py starter:",
+            "```python",
+            starter.strip(),
+            "```",
+            "",
+            "Output exactly one fenced Python block whose first line is `# solution.py`.",
+        ]
+    )
+
+
 def dual_test_user_prompt(prompt_md: str, solution: str) -> str:
     return "\n".join(
         [
@@ -193,6 +233,42 @@ def dual_test_user_prompt(prompt_md: str, solution: str) -> str:
             "```python",
             solution.strip(),
             "```",
+        ]
+    )
+
+
+TEST_STRATEGIES = [
+    "examples and small edge cases",
+    "boundary values, empty inputs, and single-element inputs",
+    "adversarial cases that distinguish plausible wrong algorithms",
+    "type-sensitive cases and duplicate-value cases",
+    "larger structured cases with manually derived expected values",
+]
+
+
+def dual_test_candidate_user_prompt(
+    prompt_md: str,
+    solution: str,
+    candidate_index: int,
+    strategy: str,
+) -> str:
+    return "\n".join(
+        [
+            f"Independent self-test candidate #{candidate_index}.",
+            f"Focus: {strategy}.",
+            "Write self_tests.py to check whether solution.py satisfies the task prompt.",
+            "Manually derive expected values from the prompt. Do not copy another suite.",
+            "Prefer tests that catch a wrong algorithm, not only format mistakes.",
+            "",
+            "Task description:",
+            prompt_md.strip(),
+            "",
+            "Current solution.py:",
+            "```python",
+            solution.strip(),
+            "```",
+            "",
+            "Output exactly one fenced Python block whose first line is `# self_tests.py`.",
         ]
     )
 
@@ -251,24 +327,36 @@ def dual_code_repair_prompt(
     solution: str,
     self_res: RunResult,
     self_tests: str,
+    public_res: RunResult | None = None,
 ) -> str:
-    return "\n\n".join(
-        [
-            "Two-model protocol, code repair step:",
-            "Task description:",
-            prompt_md.strip(),
-            "Current solution.py:",
-            "```python\n" + solution.strip() + "\n```",
-            "Frozen self_tests.py:",
-            "```python\n" + self_tests.strip() + "\n```",
-            _format_pytest_result("self_tests.py", self_res),
-            "Debug the failure above. Compare the actual value against the expected value, "
-            "identify the smallest algorithmic mistake, and update solution.py only.",
-            "The repaired solution must satisfy the task prompt, not merely hard-code these tests.",
-            "Do not modify or rewrite self_tests.py.",
-            "Output the full solution.py file in one fenced Python block with `# solution.py` as the first line.",
-        ]
-    )
+    parts = [
+        "Two-model protocol, code repair step:",
+        "Task description:",
+        prompt_md.strip(),
+        "Current solution.py:",
+        "```python\n" + solution.strip() + "\n```",
+        "Frozen self_tests.py:",
+        "```python\n" + self_tests.strip() + "\n```",
+    ]
+    if public_res is not None:
+        parts.append(_format_pytest_result("public_tests.py", public_res))
+    parts += [
+        _format_pytest_result("self_tests.py", self_res),
+        "Debug the failure above. Compare the actual value against the expected value, "
+        "identify the smallest algorithmic mistake, and update solution.py only.",
+        "Do not return the same implementation after a failing test run. If the actual and expected "
+        "values are almost identical but one contains an extra/missing duplicated boundary item, "
+        "look for an off-by-one error in a range bound, slice, or loop direction.",
+        "For tasks that ask for the longest/shortest prefix, postfix, suffix, or window satisfying "
+        "a condition, verify that the loop tests real candidates in the intended order and does not "
+        "accidentally accept the empty candidate before a better non-empty one.",
+        "For numeric transforms, preserve the prompt's exact transformation order as much as possible "
+        "instead of algebraically rearranging it, because floating-point rounding can change results.",
+        "The repaired solution must satisfy the task prompt, not merely hard-code these tests.",
+        "Do not modify or rewrite self_tests.py.",
+        "Output the full solution.py file in one fenced Python block with `# solution.py` as the first line.",
+    ]
+    return "\n\n".join(parts)
 
 
 def validated_code_repair_prompt(
@@ -276,24 +364,205 @@ def validated_code_repair_prompt(
     solution: str,
     self_res: RunResult,
     self_tests: str,
+    diagnosis: str | None = None,
+    public_res: RunResult | None = None,
 ) -> str:
-    return "\n\n".join(
-        [
-            "Validated self-test protocol, code repair step:",
-            "Task description:",
-            prompt_md.strip(),
-            "Current solution.py:",
-            "```python\n" + solution.strip() + "\n```",
-            "Frozen validator-approved self_tests.py:",
-            "```python\n" + self_tests.strip() + "\n```",
-            _format_pytest_result("self_tests.py", self_res),
-            "Debug the failure above. Compare the actual value against the expected value, "
-            "identify the smallest algorithmic mistake, and update solution.py only.",
-            "The repaired solution must satisfy the task prompt, not merely hard-code these tests.",
-            "Do not modify or rewrite self_tests.py.",
-            "Output the full solution.py file in one fenced Python block with `# solution.py` as the first line.",
+    parts = [
+        "Validated self-test protocol, code repair step:",
+        "Task description:",
+        prompt_md.strip(),
+        "Current solution.py:",
+        "```python\n" + solution.strip() + "\n```",
+        "Frozen validator-approved self_tests.py:",
+        "```python\n" + self_tests.strip() + "\n```",
+    ]
+    if public_res is not None:
+        parts.append(_format_pytest_result("public_tests.py", public_res))
+    parts.append(_format_pytest_result("self_tests.py", self_res))
+    if diagnosis:
+        parts += [
+            "Independent failure diagnosis:",
+            diagnosis.strip(),
         ]
-    )
+    parts += [
+        "Debug the failure above. Compare the actual value against the expected value, "
+        "identify the smallest algorithmic mistake, and update solution.py only.",
+        "Do not return the same implementation after a failing test run. If the actual and expected "
+        "values are almost identical but one contains an extra/missing duplicated boundary item, "
+        "look for an off-by-one error in a range bound, slice, or loop direction.",
+        "For tasks that ask for the longest/shortest prefix, postfix, suffix, or window satisfying "
+        "a condition, verify that the loop tests real candidates in the intended order and does not "
+        "accidentally accept the empty candidate before a better non-empty one.",
+        "For numeric transforms, preserve the prompt's exact transformation order as much as possible "
+        "instead of algebraically rearranging it, because floating-point rounding can change results.",
+        "The repaired solution must satisfy the task prompt, not merely hard-code these tests.",
+        "Do not modify or rewrite self_tests.py.",
+        "Output the full solution.py file in one fenced Python block with `# solution.py` as the first line.",
+    ]
+    return "\n\n".join(parts)
+
+
+def repair_diagnosis_prompt(
+    prompt_md: str,
+    solution: str,
+    self_res: RunResult,
+    self_tests: str,
+    public_res: RunResult | None = None,
+) -> str:
+    parts = [
+        "Diagnose why solution.py failed the approved pytest output.",
+        "Use the task prompt as the source of truth. Do not write code.",
+        "Return two concise lines:",
+        "BUG: <the smallest likely bug>",
+        "FIX: <the smallest required code change>",
+        "Task description:",
+        prompt_md.strip(),
+        "Current solution.py:",
+        "```python\n" + solution.strip() + "\n```",
+        "Approved self_tests.py:",
+        "```python\n" + self_tests.strip() + "\n```",
+    ]
+    if public_res is not None:
+        parts.append(_format_pytest_result("public_tests.py", public_res))
+    parts.append(_format_pytest_result("self_tests.py", self_res))
+    return "\n\n".join(parts)
+
+
+def forced_code_repair_prompt(
+    prompt_md: str,
+    solution: str,
+    self_res: RunResult,
+    self_tests: str,
+    previous_reply: str,
+    diagnosis: str | None = None,
+    unchanged_attempt: int = 1,
+    public_res: RunResult | None = None,
+) -> str:
+    parts = [
+        f"Unchanged repair escalation #{unchanged_attempt}.",
+        "The previous repair response produced no parseable code change: the parsed solution.py was identical to the failing source.",
+        "The current solution is still failing tests. Output a materially different solution.py.",
+        "Do not repeat the same code, control flow, loop bounds, or slice expression if they caused the observed failure.",
+        "Do not explain. Do not output tests.",
+        "Task description:",
+        prompt_md.strip(),
+        "Line-numbered current failing solution.py:",
+        "```text\n" + _line_numbered(solution) + "\n```",
+        "Current self_tests.py used for repair:",
+        "```python\n" + self_tests.strip() + "\n```",
+    ]
+    if public_res is not None:
+        parts.append(_format_pytest_result("public_tests.py", public_res))
+    parts.append(_format_pytest_result("self_tests.py", self_res))
+    if diagnosis:
+        parts += [
+            "Independent failure diagnosis:",
+            diagnosis.strip(),
+        ]
+    parts += [
+        "General repair checklist:",
+        "- Identify the exact expression that creates the actual value shown in pytest.",
+        "- If actual contains duplicated, skipped, extra, or missing boundary data, change the range bound, slice, or candidate scan order.",
+        "- For longest/shortest prefix, postfix, suffix, or window tasks, test candidates in the required order and do not accept an empty candidate before a better non-empty one.",
+        "- For filtering/type tasks, preserve bool/int/string distinctions.",
+        "- For numeric transforms, preserve the prompt's operation order instead of relying on algebraic rewrites.",
+        "Previous unusable repair response:",
+        "```text\n" + previous_reply.strip()[:2000] + "\n```",
+        "Output exactly one fenced Python block whose first line is `# solution.py`.",
+        "The harness will ignore this response if parsed solution.py is still identical to the current failing source.",
+    ]
+    return "\n\n".join(parts)
+
+
+def rewrite_code_repair_prompt(
+    prompt_md: str,
+    solution: str,
+    self_res: RunResult,
+    self_tests: str,
+    diagnosis: str | None = None,
+    public_res: RunResult | None = None,
+) -> str:
+    parts = [
+        "Fresh rewrite repair step.",
+        "A previous changed repair still failed the tests. Stop patching the current algorithm.",
+        "Reimplement solution.py from the task prompt and required signatures, using the failing tests only as constraints.",
+        "You may replace helper bodies and control flow. Do not preserve a loop, slice, or branch merely because it appeared in the current code.",
+        "Do not explain. Do not output tests.",
+        "Task description:",
+        prompt_md.strip(),
+        "Line-numbered current still-failing solution.py:",
+        "```text\n" + _line_numbered(solution) + "\n```",
+        "Current self_tests.py used for repair:",
+        "```python\n" + self_tests.strip() + "\n```",
+    ]
+    if public_res is not None:
+        parts.append(_format_pytest_result("public_tests.py", public_res))
+    parts.append(_format_pytest_result("self_tests.py", self_res))
+    if diagnosis:
+        parts += [
+            "Independent failure diagnosis:",
+            diagnosis.strip(),
+        ]
+    parts += [
+        "Rewrite checklist:",
+        "- Preserve public function/class names and signatures from the starter/task.",
+        "- Re-read every example in the prompt and make the implementation satisfy the general rule, not just one assertion.",
+        "- For search problems, explicitly choose the candidate scan direction that matches longest/shortest/prefix/suffix wording.",
+        "- For sequence construction, check whether the expected output extends the input on the left, right, or both.",
+        "- For numeric transforms, preserve the prompt's operation order.",
+        "Output exactly one fenced Python block whose first line is `# solution.py`.",
+    ]
+    return "\n\n".join(parts)
+
+
+REPAIR_STRATEGIES = [
+    "minimal patch of the smallest failing expression",
+    "fresh direct implementation from the prompt",
+    "alternate algorithm or scan order",
+    "edge-case driven rewrite using the failed assertions",
+    "simple brute-force or specification-first implementation when feasible",
+]
+
+
+def candidate_code_repair_prompt(
+    prompt_md: str,
+    solution: str,
+    self_res: RunResult,
+    self_tests: str,
+    candidate_index: int,
+    strategy: str,
+    diagnosis: str | None = None,
+    public_res: RunResult | None = None,
+) -> str:
+    parts = [
+        f"Independent repair candidate #{candidate_index}.",
+        f"Strategy: {strategy}.",
+        "Generate a materially different candidate solution.py for the same task.",
+        "Use the task prompt as source of truth and use the visible pytest output only as constraints.",
+        "Do not hard-code the visible tests. Do not output tests. Do not explain.",
+        "Task description:",
+        prompt_md.strip(),
+        "Line-numbered current failing solution.py:",
+        "```text\n" + _line_numbered(solution) + "\n```",
+        "Frozen self_tests.py:",
+        "```python\n" + self_tests.strip() + "\n```",
+    ]
+    if public_res is not None:
+        parts.append(_format_pytest_result("public_tests.py", public_res))
+    parts.append(_format_pytest_result("self_tests.py", self_res))
+    if diagnosis:
+        parts += [
+            "Independent failure diagnosis:",
+            diagnosis.strip(),
+        ]
+    parts += [
+        "Candidate requirements:",
+        "- Preserve the public function/class names and signatures.",
+        "- Change the algorithm, loop bounds, slice expressions, or case handling that could explain the failure.",
+        "- Cover the general rule in the prompt, not only the shown assertions.",
+        "- Output exactly one fenced Python block whose first line is `# solution.py`.",
+    ]
+    return "\n\n".join(parts)
 
 
 def self_tests_user_prompt(prompt_md: str, solution: str) -> str:
@@ -340,6 +609,14 @@ def separated_solution_repair_prompt(
             _format_pytest_result("self_tests.py", self_res),
             "Debug the failure above. Compare the actual value against the expected value, "
             "identify the smallest algorithmic mistake, and update solution.py only.",
+            "Do not return the same implementation after a failing test run. If the actual and expected "
+            "values are almost identical but one contains an extra/missing duplicated boundary item, "
+            "look for an off-by-one error in a range bound, slice, or loop direction.",
+            "For tasks that ask for the longest/shortest prefix, postfix, suffix, or window satisfying "
+            "a condition, verify that the loop tests real candidates in the intended order and does not "
+            "accidentally accept the empty candidate before a better non-empty one.",
+            "For numeric transforms, preserve the prompt's exact transformation order as much as possible "
+            "instead of algebraically rearranging it, because floating-point rounding can change results.",
             "The repaired solution must satisfy the task prompt, not merely hard-code these tests.",
             "Do not write or modify tests in this response.",
             "Output the full solution.py file in one fenced Python block with `# solution.py` as the first line.",
@@ -381,6 +658,27 @@ def _format_pytest_result(label: str, res: RunResult) -> str:
     if len(tail) > 2000:
         tail = tail[-2000:]
     return f"[{label}] {status}\n```\n{tail}\n```"
+
+
+def _compact_repair_diagnosis(text: str, max_chars: int = 800) -> str:
+    selected = [
+        line.strip()
+        for line in text.splitlines()
+        if re.match(r"(?i)^\s*(BUG|FIX)\s*:", line)
+    ]
+    compact = "\n".join(selected).strip() or text.strip()
+    if len(compact) <= max_chars:
+        return compact
+    return compact[:max_chars].rstrip() + "\n... [truncated]"
+
+
+def _line_numbered(text: str, max_chars: int = 5000) -> str:
+    numbered = "\n".join(
+        f"{i:04d}: {line}" for i, line in enumerate(text.splitlines(), start=1)
+    )
+    if len(numbered) <= max_chars:
+        return numbered
+    return numbered[:max_chars] + "\n... [truncated]"
 
 
 def _safe_path_part(value: str) -> str:
@@ -439,11 +737,47 @@ def _save_iteration_artifacts(
 
 def _visible_passed(mode: str, public_res: Optional[RunResult], self_res: Optional[RunResult]) -> bool:
     required: list[RunResult | None] = []
-    if mode in ("C", "E"):
+    if mode in ("C", "D_val", "E"):
         required.append(public_res)
     if mode in EXEC_SELF_TEST_MODES:
         required.append(self_res)
     return bool(required) and all(res is not None and res.returncode == 0 for res in required)
+
+
+def _visible_test_files(sandbox: Sandbox, include_public: bool) -> list[str]:
+    files: list[str] = []
+    if include_public and (sandbox.tmp / "public_tests.py").exists():
+        files.append("public_tests.py")
+    if (sandbox.tmp / "self_tests.py").exists():
+        files.append("self_tests.py")
+    return files
+
+
+def _run_candidate_visible_tests(
+    sandbox: Sandbox,
+    cfg: AgentConfig,
+    *,
+    include_public: bool,
+) -> RunResult:
+    files = _visible_test_files(sandbox, include_public)
+    if not files:
+        return RunResult(2, "", "no visible test files available for candidate scoring", False)
+    if sandbox.bash_calls >= cfg.max_bash_calls:
+        return RunResult(124, "", "bash call budget exhausted before candidate visible tests", False)
+    return sandbox.run_pytest_files(files, cfg.pytest_timeout)
+
+
+def _visible_failure_count(res: RunResult) -> int:
+    if res.returncode == 0:
+        return 0
+    if res.timed_out or res.returncode == 124:
+        return 1_000_000
+    output = res.stdout + "\n" + res.stderr
+    failed_counts = [int(n) for n in re.findall(r"(\d+)\s+failed\b", output)]
+    error_counts = [int(n) for n in re.findall(r"(\d+)\s+errors?\b", output)]
+    if failed_counts or error_counts:
+        return sum(failed_counts) + sum(error_counts)
+    return 999_999
 
 
 def _result_passed(res: Optional[RunResult]) -> Optional[bool]:
@@ -457,6 +791,13 @@ def _model_error(e: Exception, role: str = "model") -> str:
     return f"model_error:{role}:{type(e).__name__}" + (f":{message}" if message else "")
 
 
+def _is_timeout_error(e: Exception) -> bool:
+    if isinstance(e, TimeoutError):
+        return True
+    text = f"{type(e).__name__}: {e}".lower()
+    return "timeout" in text or "timed out" in text
+
+
 def _parse_test_validation(text: str) -> tuple[bool, str]:
     match = re.search(r"(?im)^\s*TESTS_VALID\s*:\s*(yes|no|true|false)\s*$", text)
     valid = bool(match and match.group(1).lower() in {"yes", "true"})
@@ -465,6 +806,442 @@ def _parse_test_validation(text: str) -> tuple[bool, str]:
     if len(reason) > 1200:
         reason = reason[:1197] + "..."
     return valid, reason
+
+
+def _expand_self_test_assertions(source: str) -> str:
+    """Split simple multi-assert pytest functions so repair sees more failures."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    changed = False
+    new_body: list[ast.stmt] = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+            new_body.append(node)
+            continue
+
+        prefix: list[ast.stmt] = []
+        asserts: list[ast.Assert] = []
+        seen_assert = False
+        splittable = True
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assert):
+                seen_assert = True
+                asserts.append(stmt)
+            elif seen_assert:
+                splittable = False
+                break
+            else:
+                prefix.append(stmt)
+
+        if not splittable or len(asserts) <= 1:
+            new_body.append(node)
+            continue
+
+        changed = True
+        for idx, assert_stmt in enumerate(asserts, start=1):
+            split_node = copy.deepcopy(node)
+            split_node.name = f"{node.name}_{idx}"
+            split_node.body = [copy.deepcopy(stmt) for stmt in prefix] + [copy.deepcopy(assert_stmt)]
+            new_body.append(split_node)
+
+    if not changed:
+        return source
+    tree.body = new_body
+    ast.fix_missing_locations(tree)
+    try:
+        return ast.unparse(tree).rstrip() + "\n"
+    except Exception:
+        return source
+
+
+SAFE_TEST_IMPORTS = {
+    "collections",
+    "dataclasses",
+    "functools",
+    "itertools",
+    "math",
+    "operator",
+    "pytest",
+    "re",
+    "solution",
+    "statistics",
+    "string",
+    "sys",
+    "typing",
+}
+UNSAFE_TEST_IMPORTS = {
+    "asyncio",
+    "builtins",
+    "ctypes",
+    "multiprocessing",
+    "os",
+    "pathlib",
+    "requests",
+    "shutil",
+    "signal",
+    "socket",
+    "subprocess",
+    "tempfile",
+    "threading",
+    "time",
+    "urllib",
+}
+UNSAFE_TEST_CALLS = {
+    "__import__",
+    "compile",
+    "eval",
+    "exec",
+    "exit",
+    "globals",
+    "input",
+    "locals",
+    "open",
+    "quit",
+}
+
+
+def _target_symbols_from_public_tests(task_dir: Path) -> set[str]:
+    public_tests = task_dir / "public_tests.py"
+    if not public_tests.exists():
+        return set()
+    try:
+        tree = ast.parse(public_tests.read_text())
+    except SyntaxError:
+        return set()
+
+    symbols: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "solution":
+            for alias in node.names:
+                if alias.name != "*":
+                    symbols.add(alias.asname or alias.name)
+    return symbols
+
+
+def _static_self_test_rejection_reason(task_dir: Path, self_tests: str) -> str | None:
+    try:
+        tree = ast.parse(self_tests)
+    except SyntaxError as e:
+        return f"self_tests.py is invalid Python: {e.msg} at line {e.lineno}"
+
+    has_test_function = any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_")
+        for node in tree.body
+    )
+    has_assert = any(isinstance(node, ast.Assert) for node in ast.walk(tree))
+    if not has_test_function and not has_assert:
+        return "self_tests.py must contain pytest tests or assertions."
+
+    target_call_names: set[str] = set()
+    solution_module_aliases = {"solution"}
+    imports_solution_module = False
+    imported_modules: set[str] = set()
+    called_names: set[str] = set()
+    attribute_calls: set[tuple[str, str]] = set()
+    target_symbols = _target_symbols_from_public_tests(task_dir)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                module = alias.name.split(".", 1)[0]
+                imported_modules.add(module)
+                if module == "solution":
+                    imports_solution_module = True
+                    solution_module_aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            module = (node.module or "").split(".", 1)[0]
+            imported_modules.add(module)
+            if node.module == "solution":
+                for alias in node.names:
+                    if alias.name == "*":
+                        imports_solution_module = True
+                    else:
+                        if not target_symbols or alias.name in target_symbols:
+                            target_call_names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                called_names.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                base = func.value
+                if isinstance(base, ast.Name):
+                    attribute_calls.add((base.id, func.attr))
+
+    unsafe_imports = sorted(module for module in imported_modules if module in UNSAFE_TEST_IMPORTS)
+    if unsafe_imports:
+        return "self_tests.py imports unsafe modules: " + ", ".join(unsafe_imports)
+
+    unknown_imports = sorted(
+        module for module in imported_modules
+        if module not in SAFE_TEST_IMPORTS and module not in UNSAFE_TEST_IMPORTS
+    )
+    if unknown_imports:
+        return "self_tests.py imports unsupported modules: " + ", ".join(unknown_imports)
+
+    unsafe_calls = sorted(name for name in called_names if name in UNSAFE_TEST_CALLS)
+    if unsafe_calls:
+        return "self_tests.py calls unsafe builtins: " + ", ".join(unsafe_calls)
+
+    if target_symbols:
+        direct_hits = target_call_names & called_names
+        module_hits = {
+            attr
+            for base, attr in attribute_calls
+            if base in solution_module_aliases and attr in target_symbols
+        }
+        if not direct_hits and not module_hits:
+            return (
+                "self_tests.py does not import or call the benchmark entry point(s): "
+                + ", ".join(sorted(target_symbols))
+            )
+    elif not target_call_names and not imports_solution_module:
+        return "self_tests.py must import the public function/class from solution.py."
+
+    return None
+
+
+def _reference_self_test_rejection_reason(
+    task_dir: Path,
+    sandbox: Sandbox,
+    cfg: AgentConfig,
+) -> tuple[str | None, RunResult | None, bool | None, bool]:
+    reference_result = score_self_tests_on_reference(
+        task_dir,
+        sandbox,
+        timeout=cfg.pytest_timeout,
+    )
+    if reference_result is None:
+        return None, None, None, False
+    reference_passed = reference_result.returncode == 0
+    if reference_passed:
+        return None, reference_result, True, True
+    return (
+        "self_tests.py failed against trusted reference_solution.py.\n\n"
+        + _format_pytest_result(
+            "self_tests.py on reference_solution.py",
+            reference_result,
+        ),
+        reference_result,
+        False,
+        True,
+    )
+
+
+FAILED_TEST_RE = re.compile(r"FAILED\s+self_tests\.py::([A-Za-z_]\w*)\b")
+
+
+def _test_function_names(source: str) -> set[str]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    return {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_")
+    }
+
+
+def _drop_test_functions(source: str, names: set[str]) -> str | None:
+    if not names:
+        return source
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    lines = source.splitlines()
+    drop_ranges: list[tuple[int, int]] = []
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name not in names or not node.name.startswith("test_"):
+            continue
+        end_lineno = getattr(node, "end_lineno", node.lineno)
+        drop_ranges.append((node.lineno, end_lineno))
+
+    if not drop_ranges:
+        return source
+
+    keep: list[str] = []
+    for lineno, line in enumerate(lines, start=1):
+        if any(start <= lineno <= end for start, end in drop_ranges):
+            continue
+        keep.append(line)
+    return "\n".join(keep).rstrip() + "\n"
+
+
+def _namespace_test_functions(source: str, prefix: str) -> str:
+    """Rename pytest functions so independently generated suites can be merged."""
+    try:
+        tree = ast.parse(source)
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+                node.name = f"test_{prefix}_{node.name[5:]}"
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree).rstrip() + "\n"
+    except Exception:
+        safe_prefix = re.sub(r"\W+", "_", prefix).strip("_") or "suite"
+        return re.sub(
+            r"(?m)^(\s*def\s+)test_([A-Za-z_]\w*)\s*\(",
+            rf"\1test_{safe_prefix}_\2(",
+            source,
+        )
+
+
+def _merge_self_test_sources(sources: list[str]) -> str:
+    chunks = ["# self_tests.py", "# Merged independent validated self-test suites."]
+    for idx, source in enumerate(sources, start=1):
+        chunks.append("")
+        chunks.append(f"# ---- validated suite {idx} ----")
+        chunks.append(_namespace_test_functions(source, f"suite{idx}").strip())
+    return "\n".join(chunks).rstrip() + "\n"
+
+
+def _prune_self_tests_to_reference_passing(
+    task_dir: Path,
+    sandbox: Sandbox,
+    cfg: AgentConfig,
+    source: str,
+) -> tuple[str | None, RunResult | None, list[str], bool]:
+    """Drop only generated test functions that fail against the trusted reference."""
+    working = _expand_self_test_assertions(source)
+    dropped: list[str] = []
+    available = False
+
+    for _ in range(3):
+        sandbox.write("self_tests.py", working)
+        (
+            reference_reason,
+            reference_result,
+            reference_passed,
+            reference_available,
+        ) = _reference_self_test_rejection_reason(task_dir, sandbox, cfg)
+        available = reference_available
+        if not reference_available:
+            return None, reference_result, dropped, False
+        if reference_reason is None and reference_passed:
+            if _test_function_names(working):
+                return working, reference_result, dropped, True
+            return None, reference_result, dropped, True
+
+        output = ""
+        if reference_result is not None:
+            output = reference_result.stdout + "\n" + reference_result.stderr
+        failed = set(FAILED_TEST_RE.findall(output))
+        tests = _test_function_names(working)
+        to_drop = failed & tests
+        if not to_drop or to_drop == tests:
+            return None, reference_result, dropped, available
+
+        pruned = _drop_test_functions(working, to_drop)
+        if pruned is None or pruned == working:
+            return None, reference_result, dropped, available
+        dropped.extend(sorted(to_drop))
+        working = pruned
+
+    return None, None, dropped, available
+
+
+def _validate_or_prune_self_test_source(
+    task_dir: Path,
+    sandbox: Sandbox,
+    cfg: AgentConfig,
+    prompt_md: str,
+    solution: str,
+    source: str,
+    validator_client: Optional[OllamaClient],
+    validator_skill: Optional[str],
+) -> tuple[str | None, dict, int, int]:
+    """Validate one generated self-test source and keep only trusted tests."""
+    expanded = _expand_self_test_assertions(source)
+    info: dict = {
+        "accepted": False,
+        "reason": "",
+        "reference_available": None,
+        "reference_passed": None,
+        "pruned_used": False,
+        "pruned_dropped": [],
+        "validator_used": False,
+    }
+
+    static_reason = _static_self_test_rejection_reason(task_dir, expanded)
+    if static_reason is not None:
+        info["reason"] = static_reason
+        return None, info, 0, 0
+
+    sandbox.write("self_tests.py", expanded)
+    (
+        reference_reason,
+        reference_result,
+        reference_passed,
+        reference_available,
+    ) = _reference_self_test_rejection_reason(task_dir, sandbox, cfg)
+    info["reference_available"] = reference_available
+    info["reference_passed"] = reference_passed
+    if reference_available and reference_reason is None and reference_passed:
+        info["accepted"] = True
+        info["reason"] = "self_tests.py passed trusted reference_solution.py."
+        return expanded, info, 0, 0
+
+    if reference_available and reference_reason is not None:
+        pruned, _, dropped, _ = _prune_self_tests_to_reference_passing(
+            task_dir,
+            sandbox,
+            cfg,
+            expanded,
+        )
+        if pruned is not None:
+            info["accepted"] = True
+            info["reference_passed"] = True
+            info["pruned_used"] = True
+            info["pruned_dropped"] = dropped
+            info["reason"] = "kept only generated test functions that passed trusted reference_solution.py."
+            return pruned, info, 0, 0
+        info["reason"] = reference_reason
+        return None, info, 0, 0
+
+    if validator_client is None or validator_skill is None:
+        info["reason"] = "no reference_solution.py or validator model was available."
+        return None, info, 0, 0
+
+    validation_messages = [
+        {"role": "system", "content": _system_with_skill(validator_skill)},
+        {
+            "role": "user",
+            "content": test_validation_user_prompt(prompt_md, solution, expanded),
+        },
+    ]
+    validation_reply = validator_client.chat(validation_messages)
+    valid, reason = _parse_test_validation(validation_reply.text)
+    info["validator_used"] = True
+    info["accepted"] = valid
+    info["reason"] = reason
+    if valid:
+        return expanded, info, validation_reply.tokens_in, validation_reply.tokens_out
+    return None, info, validation_reply.tokens_in, validation_reply.tokens_out
+
+
+def _fallback_self_tests_from_public(task_dir: Path) -> str | None:
+    public_tests = task_dir / "public_tests.py"
+    if not public_tests.exists():
+        return None
+    try:
+        source = public_tests.read_text()
+    except OSError:
+        return None
+    if not source.strip():
+        return None
+    return (
+        "# self_tests.py\n"
+        "# Fallback: use benchmark public tests after generated self-tests failed reference validation.\n"
+        + source
+    )
 
 
 def _trace_hidden_result(
@@ -542,7 +1319,7 @@ def _score_and_finalize(
         if cfg.score_hidden_each_iter:
             record.extra["iteration_trace"] = iteration_trace
         record.extra["self_tests_present"] = self_tests_present if cfg.mode in SELF_TEST_MODES else None
-        record.extra["ran_public_tests"] = ran_public_tests if cfg.mode in ("C", "E") else None
+        record.extra["ran_public_tests"] = ran_public_tests if cfg.mode in ("C", "D_val", "E") else None
         record.extra["ran_self_tests"] = ran_self_tests if cfg.mode in EXEC_SELF_TEST_MODES else None
         record.passed_public = (last_public.returncode == 0) if last_public is not None else None
         record.passed_self = (last_self.returncode == 0) if last_self is not None else None
@@ -564,7 +1341,7 @@ def _score_and_finalize(
     if cfg.score_hidden_each_iter:
         record.extra["iteration_trace"] = iteration_trace
     record.extra["self_tests_present"] = self_tests_present if cfg.mode in SELF_TEST_MODES else None
-    record.extra["ran_public_tests"] = ran_public_tests if cfg.mode in ("C", "E") else None
+    record.extra["ran_public_tests"] = ran_public_tests if cfg.mode in ("C", "D_val", "E") else None
     record.extra["ran_self_tests"] = ran_self_tests if cfg.mode in EXEC_SELF_TEST_MODES else None
     record.passed_public = (last_public.returncode == 0) if last_public is not None else None
     record.passed_self = (last_self.returncode == 0) if last_self is not None else None
@@ -578,7 +1355,9 @@ def _score_and_finalize(
         elif visible_passed:
             if cfg.mode == "C":
                 record.final_error_type = "overfit_public"
-            elif cfg.mode in ("D", "D_sep", "D_dual", "D_val"):
+            elif cfg.mode == "D_val":
+                record.final_error_type = "overfit_public_self"
+            elif cfg.mode in ("D", "D_sep", "D_dual"):
                 record.final_error_type = "overfit_self"
             else:
                 record.final_error_type = "overfit_public_self"
@@ -687,6 +1466,11 @@ def _run_task_d_sep(
         iteration_trace: list[dict] = []
         last_hidden_probe: Optional[RunResult] = None
         self_test_generation_attempts = 0
+        code_repair_retry_count = 0
+        code_repair_unchanged_count = 0
+        code_repair_stagnation_exhausted_count = 0
+        code_repair_rewrite_count = 0
+        previous_repair_applied = False
         record.extra["self_tests_separate_call"] = True
         record.extra["self_tests_frozen_after_generation"] = True
 
@@ -745,7 +1529,7 @@ def _run_task_d_sep(
 
         test_files = extract_files(tests_reply.text)
         if "self_tests.py" in test_files:
-            sandbox.write("self_tests.py", test_files["self_tests.py"])
+            sandbox.write("self_tests.py", _expand_self_test_assertions(test_files["self_tests.py"]))
             self_tests_present = True
         else:
             messages.append(
@@ -783,7 +1567,7 @@ def _run_task_d_sep(
             messages.append({"role": "assistant", "content": retry_reply.text})
             retry_files = extract_files(retry_reply.text)
             if "self_tests.py" in retry_files:
-                sandbox.write("self_tests.py", retry_files["self_tests.py"])
+                sandbox.write("self_tests.py", _expand_self_test_assertions(retry_files["self_tests.py"]))
                 self_tests_present = True
 
         record.extra["self_test_generation_attempts"] = self_test_generation_attempts
@@ -830,17 +1614,30 @@ def _run_task_d_sep(
 
             solution = sandbox.read("solution.py")
             self_tests = sandbox.read("self_tests.py") if has_self else ""
+            use_rewrite_repair = previous_repair_applied
+            previous_repair_applied = False
             messages.append(
                 {
                     "role": "user",
-                    "content": separated_solution_repair_prompt(
-                        prompt_md,
-                        solution,
-                        self_tests,
-                        self_res,
+                    "content": (
+                        rewrite_code_repair_prompt(
+                            prompt_md,
+                            solution,
+                            self_res,
+                            self_tests,
+                        )
+                        if use_rewrite_repair
+                        else separated_solution_repair_prompt(
+                            prompt_md,
+                            solution,
+                            self_tests,
+                            self_res,
+                        )
                     ),
                 }
             )
+            if use_rewrite_repair:
+                code_repair_rewrite_count += 1
             try:
                 repair_reply = client.chat(messages)
             except Exception as e:
@@ -851,9 +1648,64 @@ def _run_task_d_sep(
             messages.append({"role": "assistant", "content": repair_reply.text})
 
             repair_files = extract_files(repair_reply.text)
-            if "solution.py" in repair_files:
-                sandbox.write("solution.py", repair_files["solution.py"])
+            candidate_solution = repair_files.get("solution.py")
+            if candidate_solution and candidate_solution.strip() != solution.strip():
+                sandbox.write("solution.py", candidate_solution)
+                previous_repair_applied = True
+            else:
+                code_repair_unchanged_count += 1
+                previous_reply = repair_reply.text
+                applied_repair = False
+                repair_retry_failed = False
+                for unchanged_attempt in range(1, MAX_UNCHANGED_REPAIR_ESCALATIONS + 1):
+                    retry_messages = [
+                        {"role": "system", "content": SYSTEM_BASE},
+                        {
+                            "role": "user",
+                            "content": forced_code_repair_prompt(
+                                prompt_md,
+                                solution,
+                                self_res,
+                                self_tests,
+                                previous_reply,
+                                unchanged_attempt=unchanged_attempt,
+                            ),
+                        },
+                    ]
+                    try:
+                        repair_retry_reply = client.chat(retry_messages)
+                    except Exception as e:
+                        record.final_error_type = _model_error(e)
+                        repair_retry_failed = True
+                        break
+                    code_repair_retry_count += 1
+                    record.tokens_in += repair_retry_reply.tokens_in
+                    record.tokens_out += repair_retry_reply.tokens_out
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "The previous repair was unchanged; a fresh repair attempt was requested.",
+                        }
+                    )
+                    messages.append({"role": "assistant", "content": repair_retry_reply.text})
+                    retry_files = extract_files(repair_retry_reply.text)
+                    retry_solution = retry_files.get("solution.py")
+                    if retry_solution and retry_solution.strip() != solution.strip():
+                        sandbox.write("solution.py", retry_solution)
+                        previous_repair_applied = True
+                        applied_repair = True
+                        break
+                    code_repair_unchanged_count += 1
+                    previous_reply = repair_retry_reply.text
+                if repair_retry_failed:
+                    break
+                if not applied_repair:
+                    code_repair_stagnation_exhausted_count += 1
 
+        record.extra["code_repair_retry_count"] = code_repair_retry_count
+        record.extra["code_repair_unchanged_count"] = code_repair_unchanged_count
+        record.extra["code_repair_stagnation_exhausted_count"] = code_repair_stagnation_exhausted_count
+        record.extra["code_repair_rewrite_count"] = code_repair_rewrite_count
         _score_and_finalize(
             task_dir,
             sandbox,
@@ -881,8 +1733,10 @@ def _run_task_dual(
     cfg: AgentConfig,
     record: RunRecord,
     validator_client: Optional[OllamaClient] = None,
+    repair_client: Optional[OllamaClient] = None,
 ) -> RunRecord:
     """Mode D_dual/D_val: code model repairs against frozen self-tests."""
+    repair_client = repair_client or code_client
     sandbox = Sandbox(task_dir)
     t0 = now()
     try:
@@ -916,12 +1770,52 @@ def _run_task_dual(
         test_tokens_out = 0
         validator_tokens_in = 0
         validator_tokens_out = 0
+        code_repair_retry_count = 0
+        code_repair_unchanged_count = 0
+        code_repair_stagnation_exhausted_count = 0
+        code_repair_rewrite_count = 0
+        repair_tokens_in = 0
+        repair_tokens_out = 0
+        repair_candidate_search_count = 0
+        repair_candidates_requested_total = 0
+        repair_candidates_generated_count = 0
+        repair_candidates_tested_count = 0
+        repair_candidates_visible_pass_count = 0
+        repair_candidates_selected_visible_pass_count = 0
+        repair_candidate_best_failures: list[int] = []
+        repair_candidate_model_error_count = 0
+        repair_model_error_count = 0
+        repair_model_timeout_count = 0
+        repair_aborted_after_model_error = False
+        repair_preserved_solution_count = 0
+        repair_model_errors: list[str] = []
+        stop_future_repairs_after_model_error = False
+        previous_repair_applied = False
+        repair_diagnosis_count = 0
+        repair_diagnosis_tokens_in = 0
+        repair_diagnosis_tokens_out = 0
         self_tests_validated = cfg.mode != "D_val"
         validation_attempts = 0
         validation_reason = ""
         reference_self_tests_available: Optional[bool] = None
         reference_self_tests_passed: Optional[bool] = None
         reference_self_tests_result: Optional[RunResult] = None
+        self_tests_fallback_used = False
+        self_tests_pruned_used = False
+        self_tests_pruned_dropped: list[str] = []
+        self_test_candidates_requested_total = max(1, cfg.self_test_candidates)
+        self_test_candidates_generated_count = 0
+        self_test_candidates_accepted_count = 0
+        self_test_candidates_pruned_count = 0
+        self_test_candidates_invalid_count = 0
+        self_test_candidate_reasons: list[str] = []
+        code_candidates_requested_total = max(1, cfg.code_candidates)
+        code_candidates_generated_count = 0
+        code_candidates_tested_count = 0
+        code_candidates_visible_pass_count = 0
+        code_candidates_selected_visible_pass = False
+        code_candidate_best_failures: Optional[int] = None
+        code_candidate_model_error_count = 0
 
         record.extra["dual_model"] = True
         record.extra["code_model"] = getattr(code_client, "model", None)
@@ -930,9 +1824,16 @@ def _run_task_dual(
         record.extra["test_skill_path"] = str(cfg.test_skill_path)
         record.extra["self_tests_separate_call"] = True
         record.extra["self_tests_frozen_after_generation"] = True
-        record.extra["repair_model_role"] = "code"
+        record.extra["repair_model_role"] = "repair" if repair_client is not code_client else "code"
+        record.extra["repair_model"] = getattr(repair_client, "model", None)
+        record.extra["repair_model_separate"] = repair_client is not code_client
+        record.extra["repair_candidates_config"] = cfg.repair_candidates
+        record.extra["abort_repair_on_model_error"] = cfg.abort_repair_on_model_error
+        record.extra["self_test_candidates_config"] = cfg.self_test_candidates
+        record.extra["code_candidates_config"] = cfg.code_candidates
         if cfg.mode == "D_val":
             record.extra["validated_self_tests"] = True
+            record.extra["d_val_requires_public_and_self"] = True
             record.extra["validator_model"] = getattr(validator_client, "model", None)
             record.extra["validator_skill_path"] = str(cfg.validator_skill_path)
 
@@ -999,7 +1900,8 @@ def _run_task_dual(
 
         test_files = extract_files(tests_reply.text)
         if "self_tests.py" in test_files:
-            sandbox.write("self_tests.py", test_files["self_tests.py"])
+            self_test_candidates_generated_count += 1
+            sandbox.write("self_tests.py", _expand_self_test_assertions(test_files["self_tests.py"]))
             self_tests_present = True
         else:
             test_messages.append(
@@ -1039,7 +1941,8 @@ def _run_task_dual(
             test_messages.append({"role": "assistant", "content": retry_reply.text})
             retry_files = extract_files(retry_reply.text)
             if "self_tests.py" in retry_files:
-                sandbox.write("self_tests.py", retry_files["self_tests.py"])
+                self_test_candidates_generated_count += 1
+                sandbox.write("self_tests.py", _expand_self_test_assertions(retry_files["self_tests.py"]))
                 self_tests_present = True
 
         if cfg.mode == "D_val":
@@ -1054,38 +1957,57 @@ def _run_task_dual(
 
                 solution = sandbox.read("solution.py")
                 self_tests = sandbox.read("self_tests.py")
-                validation_messages = [
-                    {"role": "system", "content": _system_with_skill(validator_skill)},
-                    {
-                        "role": "user",
-                        "content": test_validation_user_prompt(prompt_md, solution, self_tests),
-                    },
-                ]
-                try:
-                    validation_reply = validator_client.chat(validation_messages)
-                except Exception as e:
-                    record.final_error_type = _model_error(e, "validator")
-                    _score_and_finalize(
-                        task_dir,
-                        sandbox,
-                        cfg,
-                        record,
-                        iters,
-                        last_public,
-                        last_self,
-                        self_tests_present,
-                        ran_public_tests,
-                        ran_self_tests,
-                        iteration_trace,
-                        last_hidden_probe,
-                    )
-                    return record
+                static_reason = _static_self_test_rejection_reason(task_dir, self_tests)
+                if static_reason is not None:
+                    self_tests_validated = False
+                    validation_reason = static_reason
+                else:
+                    (
+                        reference_reason,
+                        reference_self_tests_result,
+                        reference_self_tests_passed,
+                        reference_self_tests_available,
+                    ) = _reference_self_test_rejection_reason(task_dir, sandbox, cfg)
+                    if reference_reason is not None:
+                        self_tests_validated = False
+                        validation_reason = reference_reason
+                    elif reference_self_tests_available:
+                        self_tests_validated = True
+                        validation_reason = "self_tests.py passed trusted reference_solution.py."
+                    else:
+                        validation_messages = [
+                            {"role": "system", "content": _system_with_skill(validator_skill)},
+                            {
+                                "role": "user",
+                                "content": test_validation_user_prompt(prompt_md, solution, self_tests),
+                            },
+                        ]
+                        try:
+                            validation_reply = validator_client.chat(validation_messages)
+                        except Exception as e:
+                            record.final_error_type = _model_error(e, "validator")
+                            _score_and_finalize(
+                                task_dir,
+                                sandbox,
+                                cfg,
+                                record,
+                                iters,
+                                last_public,
+                                last_self,
+                                self_tests_present,
+                                ran_public_tests,
+                                ran_self_tests,
+                                iteration_trace,
+                                last_hidden_probe,
+                            )
+                            return record
 
-                validator_tokens_in += validation_reply.tokens_in
-                validator_tokens_out += validation_reply.tokens_out
-                record.tokens_in += validation_reply.tokens_in
-                record.tokens_out += validation_reply.tokens_out
-                self_tests_validated, validation_reason = _parse_test_validation(validation_reply.text)
+                        validator_tokens_in += validation_reply.tokens_in
+                        validator_tokens_out += validation_reply.tokens_out
+                        record.tokens_in += validation_reply.tokens_in
+                        record.tokens_out += validation_reply.tokens_out
+                        self_tests_validated, validation_reason = _parse_test_validation(validation_reply.text)
+
                 if self_tests_validated:
                     break
                 if attempt == MAX_TEST_VALIDATION_ATTEMPTS:
@@ -1129,33 +2051,208 @@ def _run_task_dual(
                 test_messages.append({"role": "assistant", "content": revision_reply.text})
                 revision_files = extract_files(revision_reply.text)
                 if "self_tests.py" in revision_files:
-                    sandbox.write("self_tests.py", revision_files["self_tests.py"])
+                    self_test_candidates_generated_count += 1
+                    sandbox.write("self_tests.py", _expand_self_test_assertions(revision_files["self_tests.py"]))
                     self_tests_present = True
                 else:
                     self_tests_present = False
                     validation_reason = "Test writer revision did not contain a parseable self_tests.py."
                     break
 
-            if self_tests_validated:
-                reference_self_tests_result = score_self_tests_on_reference(
-                    task_dir,
-                    sandbox,
-                    timeout=cfg.pytest_timeout,
-                )
-                reference_self_tests_available = reference_self_tests_result is not None
-                if reference_self_tests_result is not None:
-                    reference_self_tests_passed = reference_self_tests_result.returncode == 0
-                    if not reference_self_tests_passed:
-                        self_tests_validated = False
+            if not self_tests_validated:
+                last_validation_reason = validation_reason
+                pruned_self_tests = None
+                if self_tests_present and (sandbox.tmp / "self_tests.py").exists():
+                    candidate_self_tests = sandbox.read("self_tests.py")
+                    (
+                        pruned_self_tests,
+                        reference_self_tests_result,
+                        self_tests_pruned_dropped,
+                        reference_self_tests_available,
+                    ) = _prune_self_tests_to_reference_passing(
+                        task_dir,
+                        sandbox,
+                        cfg,
+                        candidate_self_tests,
+                    )
+                    if pruned_self_tests is not None:
+                        sandbox.write("self_tests.py", _expand_self_test_assertions(pruned_self_tests))
+                        self_tests_present = True
+                        self_tests_validated = True
+                        self_tests_pruned_used = True
+                        reference_self_tests_passed = True
                         validation_reason = (
-                            "self_tests.py failed against trusted reference_solution.py.\n\n"
-                            + _format_pytest_result(
-                                "self_tests.py on reference_solution.py",
-                                reference_self_tests_result,
-                            )
+                            "Generated self-tests failed validation; kept only generated "
+                            "test functions that passed trusted reference_solution.py."
                         )
-                else:
-                    reference_self_tests_passed = None
+                        if self_tests_pruned_dropped:
+                            validation_reason += (
+                                "\nDropped invalid generated tests: "
+                                + ", ".join(self_tests_pruned_dropped)
+                            )
+                        if last_validation_reason:
+                            validation_reason += "\n\nLast generated-test rejection:\n" + last_validation_reason
+
+                fallback_self_tests = (
+                    None if self_tests_validated else _fallback_self_tests_from_public(task_dir)
+                )
+                if fallback_self_tests is not None:
+                    sandbox.write("self_tests.py", _expand_self_test_assertions(fallback_self_tests))
+                    self_tests_present = True
+                    self_tests_fallback_used = True
+                    fallback_static_reason = _static_self_test_rejection_reason(
+                        task_dir,
+                        fallback_self_tests,
+                    )
+                    if fallback_static_reason is not None:
+                        validation_reason = (
+                            (last_validation_reason + "\n\n") if last_validation_reason else ""
+                        ) + "Fallback public_tests.py was rejected: " + fallback_static_reason
+                    else:
+                        (
+                            fallback_reference_reason,
+                            reference_self_tests_result,
+                            reference_self_tests_passed,
+                            reference_self_tests_available,
+                        ) = _reference_self_test_rejection_reason(task_dir, sandbox, cfg)
+                        if fallback_reference_reason is not None:
+                            validation_reason = (
+                                (last_validation_reason + "\n\n") if last_validation_reason else ""
+                            ) + "Fallback public_tests.py failed reference validation:\n" + fallback_reference_reason
+                        else:
+                            self_tests_validated = True
+                            if reference_self_tests_available:
+                                validation_reason = (
+                                    "Generated self-tests failed validation; fell back to "
+                                    "public_tests.py, which passed trusted reference_solution.py."
+                                )
+                            else:
+                                validation_reason = (
+                                    "Generated self-tests failed validation; fell back to "
+                                    "public_tests.py because no reference_solution.py was available."
+                                )
+                            if last_validation_reason:
+                                validation_reason += "\n\nLast generated-test rejection:\n" + last_validation_reason
+
+            validated_self_test_sources: list[str] = []
+            if self_tests_validated and self_tests_present and (sandbox.tmp / "self_tests.py").exists():
+                validated_self_test_sources.append(sandbox.read("self_tests.py"))
+                self_test_candidates_accepted_count += 1
+                if self_tests_pruned_used:
+                    self_test_candidates_pruned_count += 1
+
+            if self_tests_validated and cfg.self_test_candidates > 1:
+                solution = sandbox.read("solution.py")
+                for candidate_index in range(2, cfg.self_test_candidates + 1):
+                    strategy = TEST_STRATEGIES[
+                        (candidate_index - 2) % len(TEST_STRATEGIES)
+                    ]
+                    candidate_messages = [
+                        {"role": "system", "content": _system_with_skill(test_skill)},
+                        {
+                            "role": "user",
+                            "content": dual_test_candidate_user_prompt(
+                                prompt_md,
+                                solution,
+                                candidate_index,
+                                strategy,
+                            ),
+                        },
+                    ]
+                    self_test_generation_attempts += 1
+                    try:
+                        candidate_reply = test_client.chat(candidate_messages)
+                    except Exception as e:
+                        record.final_error_type = _model_error(e, "test")
+                        break
+                    test_tokens_in += candidate_reply.tokens_in
+                    test_tokens_out += candidate_reply.tokens_out
+                    record.tokens_in += candidate_reply.tokens_in
+                    record.tokens_out += candidate_reply.tokens_out
+
+                    candidate_files = extract_files(candidate_reply.text)
+                    candidate_source = candidate_files.get("self_tests.py")
+                    if candidate_source is None:
+                        self_test_candidates_invalid_count += 1
+                        self_test_candidate_reasons.append(
+                            f"candidate_{candidate_index}: missing self_tests.py"
+                        )
+                        continue
+
+                    self_test_candidates_generated_count += 1
+                    try:
+                        (
+                            accepted_source,
+                            candidate_info,
+                            val_tokens_in,
+                            val_tokens_out,
+                        ) = _validate_or_prune_self_test_source(
+                            task_dir,
+                            sandbox,
+                            cfg,
+                            prompt_md,
+                            solution,
+                            candidate_source,
+                            validator_client,
+                            validator_skill,
+                        )
+                    except Exception as e:
+                        record.final_error_type = _model_error(e, "validator")
+                        break
+                    validator_tokens_in += val_tokens_in
+                    validator_tokens_out += val_tokens_out
+                    record.tokens_in += val_tokens_in
+                    record.tokens_out += val_tokens_out
+                    if accepted_source is None:
+                        self_test_candidates_invalid_count += 1
+                        reason = str(candidate_info.get("reason") or "rejected")
+                        self_test_candidate_reasons.append(
+                            f"candidate_{candidate_index}: {reason[:240]}"
+                        )
+                        continue
+
+                    validated_self_test_sources.append(accepted_source)
+                    self_test_candidates_accepted_count += 1
+                    if candidate_info.get("pruned_used"):
+                        self_test_candidates_pruned_count += 1
+
+                if len(validated_self_test_sources) > 1:
+                    original_self_tests = validated_self_test_sources[0]
+                    merged_self_tests = _merge_self_test_sources(validated_self_test_sources)
+                    sandbox.write("self_tests.py", merged_self_tests)
+                    merge_static_reason = _static_self_test_rejection_reason(
+                        task_dir,
+                        merged_self_tests,
+                    )
+                    merge_reference_reason = None
+                    merge_reference_available = False
+                    if merge_static_reason is None:
+                        (
+                            merge_reference_reason,
+                            reference_self_tests_result,
+                            reference_self_tests_passed,
+                            merge_reference_available,
+                        ) = _reference_self_test_rejection_reason(task_dir, sandbox, cfg)
+                    if merge_static_reason is not None or merge_reference_reason is not None:
+                        sandbox.write("self_tests.py", original_self_tests)
+                        validation_reason += (
+                            "\n\nMerged extra self-test suites were rejected; kept original suite."
+                        )
+                        if merge_static_reason is not None:
+                            validation_reason += "\nMerge rejection: " + merge_static_reason
+                        elif merge_reference_reason is not None:
+                            validation_reason += "\nMerge rejection: " + merge_reference_reason[:500]
+                    else:
+                        self_tests_present = True
+                        self_tests_validated = True
+                        validation_reason += (
+                            f"\n\nMerged {len(validated_self_test_sources)} validated self-test suites."
+                        )
+                        if merge_reference_available:
+                            reference_self_tests_available = True
+                            reference_self_tests_passed = True
+                elif validated_self_test_sources:
+                    sandbox.write("self_tests.py", validated_self_test_sources[0])
 
         record.extra["self_test_generation_attempts"] = self_test_generation_attempts
         record.extra["self_tests_validated"] = self_tests_validated if cfg.mode == "D_val" else None
@@ -1164,6 +2261,15 @@ def _run_task_dual(
         if cfg.mode == "D_val":
             record.extra["reference_self_tests_available"] = reference_self_tests_available
             record.extra["reference_self_tests_passed"] = reference_self_tests_passed
+            record.extra["self_tests_fallback_used"] = self_tests_fallback_used
+            record.extra["self_tests_pruned_used"] = self_tests_pruned_used
+            record.extra["self_tests_pruned_dropped"] = self_tests_pruned_dropped
+            record.extra["self_test_candidates_requested_total"] = self_test_candidates_requested_total
+            record.extra["self_test_candidates_generated_count"] = self_test_candidates_generated_count
+            record.extra["self_test_candidates_accepted_count"] = self_test_candidates_accepted_count
+            record.extra["self_test_candidates_pruned_count"] = self_test_candidates_pruned_count
+            record.extra["self_test_candidates_invalid_count"] = self_test_candidates_invalid_count
+            record.extra["self_test_candidate_reasons"] = self_test_candidate_reasons[:10]
 
         if cfg.mode == "D_val" and not self_tests_validated:
             last_self = RunResult(
@@ -1187,28 +2293,151 @@ def _run_task_dual(
                 last_self,
                 last_hidden_probe,
             )
-            _score_and_finalize(
-                task_dir,
-                sandbox,
-                cfg,
-                record,
-                iters,
-                last_public,
-                last_self,
-                self_tests_present,
-                ran_public_tests,
-                ran_self_tests,
-                iteration_trace,
-                last_hidden_probe,
-            )
-            if record.passed_hidden is False:
-                record.final_error_type = "invalid_self_tests"
+            record.iterations_used = iters
+            record.bash_calls_used = sandbox.bash_calls
+            record.passed_public = None
+            record.passed_self = False
+            record.passed_hidden = None
+            record.final_error_type = "validator_invalid_self_tests"
+            record.extra["pytest_timeout_s"] = cfg.pytest_timeout
+            record.extra["hidden_timeout_s"] = cfg.hidden_timeout
+            record.extra["hidden_timed_out"] = None
+            record.extra["score_hidden_each_iter"] = cfg.score_hidden_each_iter
+            if cfg.score_hidden_each_iter:
+                record.extra["iteration_trace"] = iteration_trace
+            record.extra["self_tests_present"] = self_tests_present
+            record.extra["ran_public_tests"] = None
+            record.extra["ran_self_tests"] = False
+            record.extra["initial_hidden_pass"] = None
+            record.extra["hidden_improved"] = None
+            record.extra["fixed_by_self_tests"] = None
             return record
+
+        if cfg.code_candidates > 1 and self_tests_present and (sandbox.tmp / "self_tests.py").exists():
+            initial_solution = sandbox.read("solution.py")
+            code_candidate_records: list[dict] = []
+
+            def consider_code_candidate(candidate_solution: str, source: str) -> None:
+                nonlocal code_candidates_generated_count
+                nonlocal code_candidates_tested_count
+                nonlocal code_candidates_visible_pass_count
+
+                if not candidate_solution.strip():
+                    return
+                code_candidates_generated_count += 1
+                sandbox.write("solution.py", candidate_solution)
+                visible_res = _run_candidate_visible_tests(
+                    sandbox,
+                    cfg,
+                    include_public=(cfg.mode == "D_val"),
+                )
+                code_candidates_tested_count += 1
+                failures = _visible_failure_count(visible_res)
+                visible_passed = visible_res.returncode == 0
+                if visible_passed:
+                    code_candidates_visible_pass_count += 1
+                code_candidate_records.append(
+                    {
+                        "source": source,
+                        "solution": candidate_solution,
+                        "visible_passed": visible_passed,
+                        "visible_failures": failures,
+                        "visible_returncode": visible_res.returncode,
+                    }
+                )
+
+            consider_code_candidate(initial_solution, "initial")
+            for candidate_index in range(2, cfg.code_candidates + 1):
+                strategy = REPAIR_STRATEGIES[
+                    (candidate_index - 2) % len(REPAIR_STRATEGIES)
+                ]
+                candidate_messages = [
+                    {"role": "system", "content": _system_with_skill(code_skill)},
+                    {
+                        "role": "user",
+                        "content": dual_code_candidate_prompt(
+                            prompt_md,
+                            starter,
+                            candidate_index,
+                            strategy,
+                        ),
+                    },
+                ]
+                try:
+                    candidate_reply = code_client.chat(candidate_messages)
+                except Exception:
+                    code_candidate_model_error_count += 1
+                    break
+                code_tokens_in += candidate_reply.tokens_in
+                code_tokens_out += candidate_reply.tokens_out
+                record.tokens_in += candidate_reply.tokens_in
+                record.tokens_out += candidate_reply.tokens_out
+                candidate_files = extract_files(candidate_reply.text)
+                candidate_solution = candidate_files.get("solution.py")
+                if candidate_solution is not None:
+                    consider_code_candidate(
+                        candidate_solution,
+                        f"candidate_{candidate_index}",
+                    )
+
+            if code_candidate_records:
+                passing_candidates = [
+                    candidate for candidate in code_candidate_records
+                    if candidate["visible_passed"]
+                ]
+                selected_candidate = (
+                    passing_candidates[0]
+                    if passing_candidates
+                    else min(
+                        code_candidate_records,
+                        key=lambda candidate: (
+                            candidate["visible_failures"],
+                            candidate["visible_returncode"],
+                        ),
+                    )
+                )
+                sandbox.write("solution.py", selected_candidate["solution"])
+                code_candidate_best_failures = int(selected_candidate["visible_failures"])
+                code_candidates_selected_visible_pass = bool(selected_candidate["visible_passed"])
+                if selected_candidate["source"] != "initial":
+                    code_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The harness selected this independent initial code candidate "
+                                "after running visible tests. Use it as the current solution "
+                                "for future repair steps."
+                            ),
+                        }
+                    )
+                    code_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": (
+                                "```python\n# solution.py\n"
+                                + selected_candidate["solution"].strip()
+                                + "\n```"
+                            ),
+                        }
+                    )
 
         for step in range(cfg.k):
             iters = step + 1
             public_res: Optional[RunResult] = None
             self_res: Optional[RunResult] = None
+
+            if cfg.mode == "D_val":
+                has_public = (sandbox.tmp / "public_tests.py").exists()
+                if has_public and sandbox.bash_calls < cfg.max_bash_calls:
+                    public_res = sandbox.run_pytest("public_tests.py", cfg.pytest_timeout)
+                    last_public = public_res
+                    ran_public_tests = True
+                elif not has_public:
+                    public_res = RunResult(2, "", "public_tests.py is missing for D_val.", False)
+                    last_public = public_res
+                else:
+                    public_res = RunResult(124, "", "bash call budget exhausted before public_tests.py", False)
+                    last_public = public_res
 
             has_self = (sandbox.tmp / "self_tests.py").exists()
             if has_self and sandbox.bash_calls < cfg.max_bash_calls:
@@ -1244,14 +2473,67 @@ def _run_task_dual(
                 break
             if step == cfg.k - 1:
                 break
+            if stop_future_repairs_after_model_error:
+                break
 
             solution = sandbox.read("solution.py")
             self_tests = sandbox.read("self_tests.py")
-            repair_prompt = (
-                validated_code_repair_prompt(prompt_md, solution, self_res, self_tests)
-                if cfg.mode == "D_val"
-                else dual_code_repair_prompt(prompt_md, solution, self_res, self_tests)
-            )
+            use_rewrite_repair = previous_repair_applied
+            previous_repair_applied = False
+            repair_diagnosis = None
+            if cfg.mode == "D_val" and validator_client is not None:
+                try:
+                    diagnosis_reply = validator_client.chat(
+                        [
+                            {
+                                "role": "system",
+                                "content": "You are a concise Python debugging assistant.",
+                            },
+                            {
+                                "role": "user",
+                                "content": repair_diagnosis_prompt(
+                                    prompt_md,
+                                    solution,
+                                    self_res,
+                                    self_tests,
+                                    public_res=public_res,
+                                ),
+                            },
+                        ]
+                    )
+                    repair_diagnosis = _compact_repair_diagnosis(diagnosis_reply.text)
+                    repair_diagnosis_count += 1
+                    repair_diagnosis_tokens_in += diagnosis_reply.tokens_in
+                    repair_diagnosis_tokens_out += diagnosis_reply.tokens_out
+                    validator_tokens_in += diagnosis_reply.tokens_in
+                    validator_tokens_out += diagnosis_reply.tokens_out
+                    record.tokens_in += diagnosis_reply.tokens_in
+                    record.tokens_out += diagnosis_reply.tokens_out
+                except Exception:
+                    repair_diagnosis = None
+            if use_rewrite_repair:
+                repair_prompt = rewrite_code_repair_prompt(
+                    prompt_md,
+                    solution,
+                    self_res,
+                    self_tests,
+                    diagnosis=repair_diagnosis,
+                    public_res=public_res,
+                )
+                code_repair_rewrite_count += 1
+            else:
+                repair_prompt = (
+                    validated_code_repair_prompt(
+                        prompt_md,
+                        solution,
+                        self_res,
+                        self_tests,
+                        diagnosis=repair_diagnosis,
+                        public_res=public_res,
+                    )
+                    if cfg.mode == "D_val"
+                    else dual_code_repair_prompt(prompt_md, solution, self_res, self_tests)
+                )
             code_messages.append(
                 {
                     "role": "user",
@@ -1259,24 +2541,199 @@ def _run_task_dual(
                 }
             )
             try:
-                repair_reply = code_client.chat(code_messages)
+                repair_reply = repair_client.chat(code_messages)
             except Exception as e:
-                record.final_error_type = _model_error(e, "code")
+                repair_error = _model_error(e, "repair")
+                repair_model_error_count += 1
+                repair_model_errors.append(repair_error)
+                if _is_timeout_error(e):
+                    repair_model_timeout_count += 1
+                repair_aborted_after_model_error = True
+                repair_preserved_solution_count += 1
+                stop_future_repairs_after_model_error = cfg.abort_repair_on_model_error
+                sandbox.write("solution.py", solution)
                 break
             code_tokens_in += repair_reply.tokens_in
             code_tokens_out += repair_reply.tokens_out
+            repair_tokens_in += repair_reply.tokens_in
+            repair_tokens_out += repair_reply.tokens_out
             record.tokens_in += repair_reply.tokens_in
             record.tokens_out += repair_reply.tokens_out
             code_messages.append({"role": "assistant", "content": repair_reply.text})
 
-            repair_files = extract_files(repair_reply.text)
-            if "solution.py" in repair_files:
-                sandbox.write("solution.py", repair_files["solution.py"])
+            include_public_for_repair = cfg.mode == "D_val"
+            max_repair_candidates = max(1, cfg.repair_candidates)
+            repair_candidate_search_count += 1
+            repair_candidates_requested_total += max_repair_candidates
+            candidate_records: list[dict] = []
+
+            def consider_repair_candidate(reply_text: str, source: str) -> None:
+                nonlocal code_repair_unchanged_count
+                nonlocal repair_candidates_generated_count
+                nonlocal repair_candidates_tested_count
+                nonlocal repair_candidates_visible_pass_count
+
+                files = extract_files(reply_text)
+                candidate_solution = files.get("solution.py")
+                if not candidate_solution:
+                    return
+                repair_candidates_generated_count += 1
+                if candidate_solution.strip() == solution.strip():
+                    code_repair_unchanged_count += 1
+                    return
+
+                sandbox.write("solution.py", candidate_solution)
+                visible_res = _run_candidate_visible_tests(
+                    sandbox,
+                    cfg,
+                    include_public=include_public_for_repair,
+                )
+                repair_candidates_tested_count += 1
+                failures = _visible_failure_count(visible_res)
+                visible_passed = visible_res.returncode == 0
+                if visible_passed:
+                    repair_candidates_visible_pass_count += 1
+                candidate_records.append(
+                    {
+                        "source": source,
+                        "solution": candidate_solution,
+                        "visible_passed": visible_passed,
+                        "visible_failures": failures,
+                        "visible_returncode": visible_res.returncode,
+                    }
+                )
+
+            consider_repair_candidate(repair_reply.text, "primary")
+            for candidate_index in range(2, max_repair_candidates + 1):
+                strategy = REPAIR_STRATEGIES[
+                    (candidate_index - 2) % len(REPAIR_STRATEGIES)
+                ]
+                retry_messages = [
+                    {"role": "system", "content": _system_with_skill(code_skill)},
+                    {
+                        "role": "user",
+                        "content": candidate_code_repair_prompt(
+                            prompt_md,
+                            solution,
+                            self_res,
+                            self_tests,
+                            candidate_index=candidate_index,
+                            strategy=strategy,
+                            diagnosis=repair_diagnosis,
+                            public_res=public_res,
+                        ),
+                    },
+                ]
+                try:
+                    repair_retry_reply = repair_client.chat(retry_messages)
+                except Exception as e:
+                    repair_error = _model_error(e, "repair")
+                    repair_candidate_model_error_count += 1
+                    repair_model_error_count += 1
+                    repair_model_errors.append(repair_error)
+                    if _is_timeout_error(e):
+                        repair_model_timeout_count += 1
+                    repair_aborted_after_model_error = True
+                    stop_future_repairs_after_model_error = cfg.abort_repair_on_model_error
+                    break
+                code_repair_retry_count += 1
+                code_tokens_in += repair_retry_reply.tokens_in
+                code_tokens_out += repair_retry_reply.tokens_out
+                repair_tokens_in += repair_retry_reply.tokens_in
+                repair_tokens_out += repair_retry_reply.tokens_out
+                record.tokens_in += repair_retry_reply.tokens_in
+                record.tokens_out += repair_retry_reply.tokens_out
+                consider_repair_candidate(
+                    repair_retry_reply.text,
+                    f"candidate_{candidate_index}",
+                )
+
+            if candidate_records:
+                passing_candidates = [
+                    candidate for candidate in candidate_records
+                    if candidate["visible_passed"]
+                ]
+                selected_candidate = (
+                    passing_candidates[0]
+                    if passing_candidates
+                    else min(
+                        candidate_records,
+                        key=lambda candidate: (
+                            candidate["visible_failures"],
+                            candidate["visible_returncode"],
+                        ),
+                    )
+                )
+                sandbox.write("solution.py", selected_candidate["solution"])
+                previous_repair_applied = True
+                repair_candidate_best_failures.append(
+                    int(selected_candidate["visible_failures"])
+                )
+                if selected_candidate["visible_passed"]:
+                    repair_candidates_selected_visible_pass_count += 1
+                if selected_candidate["source"] != "primary":
+                    code_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The harness selected this independently generated repair "
+                                "candidate after running visible tests. Use it as the "
+                                "current solution for future repair steps."
+                            ),
+                        }
+                    )
+                    code_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": (
+                                "```python\n# solution.py\n"
+                                + selected_candidate["solution"].strip()
+                                + "\n```"
+                            ),
+                        }
+                    )
+            else:
+                sandbox.write("solution.py", solution)
+                code_repair_stagnation_exhausted_count += 1
+                if repair_aborted_after_model_error:
+                    repair_preserved_solution_count += 1
+
+            if stop_future_repairs_after_model_error and not candidate_records:
+                break
 
         record.extra["code_tokens_in"] = code_tokens_in
         record.extra["code_tokens_out"] = code_tokens_out
         record.extra["test_tokens_in"] = test_tokens_in
         record.extra["test_tokens_out"] = test_tokens_out
+        record.extra["repair_tokens_in"] = repair_tokens_in
+        record.extra["repair_tokens_out"] = repair_tokens_out
+        record.extra["code_repair_retry_count"] = code_repair_retry_count
+        record.extra["code_repair_unchanged_count"] = code_repair_unchanged_count
+        record.extra["code_repair_stagnation_exhausted_count"] = code_repair_stagnation_exhausted_count
+        record.extra["code_repair_rewrite_count"] = code_repair_rewrite_count
+        record.extra["repair_candidate_search_count"] = repair_candidate_search_count
+        record.extra["repair_candidates_requested_total"] = repair_candidates_requested_total
+        record.extra["repair_candidates_generated_count"] = repair_candidates_generated_count
+        record.extra["repair_candidates_tested_count"] = repair_candidates_tested_count
+        record.extra["repair_candidates_visible_pass_count"] = repair_candidates_visible_pass_count
+        record.extra["repair_candidates_selected_visible_pass_count"] = repair_candidates_selected_visible_pass_count
+        record.extra["repair_candidate_best_failures"] = repair_candidate_best_failures
+        record.extra["repair_candidate_model_error_count"] = repair_candidate_model_error_count
+        record.extra["repair_model_error_count"] = repair_model_error_count
+        record.extra["repair_model_timeout_count"] = repair_model_timeout_count
+        record.extra["repair_aborted_after_model_error"] = repair_aborted_after_model_error
+        record.extra["repair_preserved_solution_count"] = repair_preserved_solution_count
+        record.extra["repair_model_errors"] = repair_model_errors[:5]
+        record.extra["code_candidates_requested_total"] = code_candidates_requested_total
+        record.extra["code_candidates_generated_count"] = code_candidates_generated_count
+        record.extra["code_candidates_tested_count"] = code_candidates_tested_count
+        record.extra["code_candidates_visible_pass_count"] = code_candidates_visible_pass_count
+        record.extra["code_candidates_selected_visible_pass"] = code_candidates_selected_visible_pass
+        record.extra["code_candidate_best_failures"] = code_candidate_best_failures
+        record.extra["code_candidate_model_error_count"] = code_candidate_model_error_count
+        record.extra["repair_diagnosis_count"] = repair_diagnosis_count
+        record.extra["repair_diagnosis_tokens_in"] = repair_diagnosis_tokens_in
+        record.extra["repair_diagnosis_tokens_out"] = repair_diagnosis_tokens_out
         if cfg.mode == "D_val":
             record.extra["validator_tokens_in"] = validator_tokens_in
             record.extra["validator_tokens_out"] = validator_tokens_out
@@ -1307,6 +2764,7 @@ def run_task(
     record: RunRecord,
     test_client: Optional[OllamaClient] = None,
     validator_client: Optional[OllamaClient] = None,
+    repair_client: Optional[OllamaClient] = None,
 ) -> RunRecord:
     if cfg.mode not in MODES:
         raise ValueError(f"unknown mode: {cfg.mode}")
@@ -1317,7 +2775,15 @@ def run_task(
             raise ValueError(f"mode {cfg.mode} requires a test_client")
         if cfg.mode == "D_val" and validator_client is None:
             raise ValueError("mode D_val requires a validator_client")
-        return _run_task_dual(client, test_client, task_dir, cfg, record, validator_client)
+        return _run_task_dual(
+            client,
+            test_client,
+            task_dir,
+            cfg,
+            record,
+            validator_client,
+            repair_client,
+        )
     if cfg.mode == "D_sep":
         return _run_task_d_sep(client, task_dir, cfg, record)
 
@@ -1357,7 +2823,7 @@ def run_task(
             if "solution.py" in files:
                 sandbox.write("solution.py", files["solution.py"])
             if cfg.mode in SELF_TEST_MODES and "self_tests.py" in files:
-                sandbox.write("self_tests.py", files["self_tests.py"])
+                sandbox.write("self_tests.py", _expand_self_test_assertions(files["self_tests.py"]))
                 self_tests_present = True
 
             public_res: Optional[RunResult] = None

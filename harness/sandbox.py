@@ -81,6 +81,12 @@ class Sandbox:
             timeout=timeout,
         )
 
+    def run_pytest_files(self, test_files: list[str], timeout: int = DEFAULT_CMD_TIMEOUT) -> RunResult:
+        return self.run(
+            [sys.executable, "-m", "pytest", "-q", "--no-header", "--tb=short", *test_files],
+            timeout=timeout,
+        )
+
     def cleanup(self) -> None:
         shutil.rmtree(self.tmp, ignore_errors=True)
 

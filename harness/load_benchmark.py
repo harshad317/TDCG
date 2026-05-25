@@ -308,8 +308,13 @@ def materialize_mbpp_plus(out_root: Path, limit: int | None = None) -> int:
 def _materialize_evalplus(out_root: Path, kind: str, limit: int | None) -> int:
     """EvalPlus distributes (base_input, plus_input, canonical_solution, atol).
     We execute the canonical solution to compute the expected output for each
-    input, then emit pytest assertions. Public = 1 input from base; hidden =
-    all base + plus inputs.
+    input, then emit pytest assertions. Public = all usable base inputs; hidden
+    = all base + plus inputs.
+
+    Using only the first base input made public feedback too weak on tasks like
+    HumanEval_10, where the first case is just the empty string. Public tests
+    should catch basic docstring/example mistakes; EvalPlus plus inputs remain
+    the stronger hidden generalization check.
     """
     from evalplus.data import get_human_eval_plus, get_mbpp_plus
     import math
@@ -344,17 +349,21 @@ def _materialize_evalplus(out_root: Path, kind: str, limit: int | None) -> int:
         if case_results is None:
             skipped += 1
             continue
-        cases = []
-        for inputs, (ok, value) in zip(all_inputs, case_results):
+        base_cases = []
+        plus_cases = []
+        for inputs, (ok, value) in zip(base, case_results[:len(base)]):
+            if ok:
+                base_cases.append((inputs, value))
+        for inputs, (ok, value) in zip(plus, case_results[len(base):]):
             if not ok:
                 continue
-            cases.append((inputs, value))
+            plus_cases.append((inputs, value))
+        cases = base_cases + plus_cases
         if not cases:
             skipped += 1
             continue
 
-        # First base case is the public test.
-        pub_case = cases[0]
+        public_cases = base_cases or cases[:1]
         if kind == "mbpp" and not re.search(rf"^def\s+{re.escape(entry)}\s*\(", prompt, re.MULTILINE):
             _, starter_func = _mbpp_signature(p["canonical_solution"], target_name=entry)
             starter = prompt.rstrip() + "\n\n" + starter_func
@@ -367,7 +376,7 @@ def _materialize_evalplus(out_root: Path, kind: str, limit: int | None) -> int:
             "A starter file `solution.py` is provided. Public tests are in "
             "`public_tests.py` — run them with `python -m pytest public_tests.py`.\n"
         )
-        pub_src = _format_evalplus_tests([pub_case], entry, atol, prefix="public")
+        pub_src = _format_evalplus_tests(public_cases, entry, atol, prefix="public")
         hid_src = _format_evalplus_tests(cases, entry, atol, prefix="hidden")
 
         task_dir = out_root / task_id
@@ -461,14 +470,22 @@ def _format_evalplus_tests(cases: list, entry: str, atol: float, prefix: str) ->
         "",
         "inf = math.inf",
         "nan = math.nan",
-        f"_ATOL = {atol!r}",
+        f"_ATOL = max(float({atol!r}), 1e-6)",
         "",
         "",
         "def _approx_eq(a, b, atol):",
-        "    if isinstance(b, float) and math.isnan(b):",
-        "        return isinstance(a, float) and math.isnan(a)",
-        "    if isinstance(b, float) and atol > 0:",
-        "        return isinstance(a, (int, float)) and math.isclose(a, b, abs_tol=atol)",
+        "    if isinstance(a, bool) or isinstance(b, bool):",
+        "        return a is b",
+        "    if isinstance(b, float):",
+        "        if math.isnan(b):",
+        "            return isinstance(a, float) and math.isnan(a)",
+        "        return isinstance(a, (int, float)) and math.isclose(a, b, rel_tol=atol, abs_tol=atol)",
+        "    if isinstance(a, float):",
+        "        return isinstance(b, (int, float)) and math.isclose(a, b, rel_tol=atol, abs_tol=atol)",
+        "    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):",
+        "        return len(a) == len(b) and all(_approx_eq(x, y, atol) for x, y in zip(a, b))",
+        "    if isinstance(a, dict) and isinstance(b, dict):",
+        "        return a.keys() == b.keys() and all(_approx_eq(a[k], b[k], atol) for k in a)",
         "    return a == b",
         "",
     ]
