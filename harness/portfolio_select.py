@@ -129,6 +129,40 @@ def _c_visible_good(row: dict | None) -> bool:
     return _public_ok(row) and not _fatal_generation_error(row) and _has_artifact(row)
 
 
+def _probe_public_passed(task_dir: Path, row: dict | None, timeout: int) -> bool | None:
+    """Run visible public tests for artifact rows that did not record them."""
+    if row is None:
+        return None
+    if row.get("passed_public") is not None:
+        return bool(row.get("passed_public"))
+
+    solution_path = _artifact_solution_path(row)
+    if solution_path is None or not (task_dir / "public_tests.py").exists():
+        return None
+
+    sandbox = Sandbox(task_dir)
+    try:
+        sandbox.write("solution.py", solution_path.read_text())
+        result = sandbox.run_pytest("public_tests.py", timeout=timeout)
+        return result.returncode == 0
+    finally:
+        sandbox.cleanup()
+
+
+def _row_with_public_probe(task_dir: Path, row: dict | None, timeout: int) -> dict | None:
+    if row is None or row.get("passed_public") is not None:
+        return row
+    public_passed = _probe_public_passed(task_dir, row, timeout)
+    if public_passed is None:
+        return row
+
+    probed = dict(row)
+    probed["extra"] = dict(row.get("extra") or {})
+    probed["passed_public"] = public_passed
+    probed["extra"]["public_probe_for_selection"] = True
+    return probed
+
+
 def choose_visible_guard(base_row: dict | None, candidate_row: dict | None) -> tuple[str, str]:
     """Choose without hidden labels.
 
@@ -151,6 +185,33 @@ def choose_visible_guard(base_row: dict | None, candidate_row: dict | None) -> t
     if _has_artifact(candidate_row):
         return "candidate", "fallback_candidate_artifact_available"
     return "none", "no_artifacts_available"
+
+
+def choose_visible_guard_with_baseline(
+    task_dir: Path,
+    baseline_row: dict | None,
+    base_row: dict | None,
+    candidate_row: dict | None,
+    public_timeout: int,
+) -> tuple[str, str, dict | None]:
+    """Choose among A, C, and D_val using only visible signals.
+
+    The baseline row normally has no recorded public result because mode A does
+    not execute tests. Running public_tests.py on its saved artifact is still a
+    visible signal. Use it only as a fallback when the C/D_val choice does not
+    pass public tests.
+    """
+    selected_kind, reason = choose_visible_guard(base_row, candidate_row)
+    selected_row = candidate_row if selected_kind == "candidate" else base_row
+
+    if _public_ok(selected_row):
+        return selected_kind, reason, baseline_row
+
+    baseline_row = _row_with_public_probe(task_dir, baseline_row, public_timeout)
+    if _c_visible_good(baseline_row):
+        return "baseline", "selected_public_failed_baseline_public_passed", baseline_row
+
+    return selected_kind, reason, baseline_row
 
 
 def _final_error_from_hidden(
@@ -181,6 +242,7 @@ def _copy_selected_artifacts(
 def build_selected_record(
     *,
     task_dir: Path,
+    baseline_row: dict | None,
     base_row: dict | None,
     candidate_row: dict | None,
     selected_kind: str,
@@ -191,9 +253,14 @@ def build_selected_record(
     save_artifacts: bool,
     artifact_root: Path,
 ) -> RunRecord:
-    source_row = candidate_row if selected_kind == "candidate" else base_row
+    if selected_kind == "candidate":
+        source_row = candidate_row
+    elif selected_kind == "baseline":
+        source_row = baseline_row
+    else:
+        source_row = base_row
     if source_row is None:
-        source_row = base_row or candidate_row
+        source_row = base_row or candidate_row or baseline_row
     if source_row is None:
         raise ValueError(f"no source rows for {task_dir.name}")
 
@@ -202,7 +269,13 @@ def build_selected_record(
         task_id=task_dir.name,
         model=str(source_row.get("model")),
         mode="P_select",
-        k=int(candidate_row.get("k", base_row.get("k", 3)) if candidate_row else base_row.get("k", 3)),
+        k=int(
+            candidate_row.get("k", 3)
+            if candidate_row
+            else base_row.get("k", 3)
+            if base_row
+            else source_row.get("k", 3)
+        ),
         seed=seed,
     )
     record.extra["batch_tag"] = out_batch_tag
@@ -212,6 +285,9 @@ def build_selected_record(
     record.extra["selected_source"] = selected_kind
     record.extra["selected_mode"] = source_row.get("mode")
     record.extra["selected_k"] = source_row.get("k")
+    record.extra["baseline_mode"] = None if baseline_row is None else baseline_row.get("mode")
+    record.extra["baseline_k"] = None if baseline_row is None else baseline_row.get("k")
+    record.extra["baseline_public_passed"] = None if baseline_row is None else baseline_row.get("passed_public")
     record.extra["base_mode"] = None if base_row is None else base_row.get("mode")
     record.extra["base_k"] = None if base_row is None else base_row.get("k")
     record.extra["candidate_mode"] = None if candidate_row is None else candidate_row.get("mode")
@@ -296,10 +372,13 @@ def main() -> int:
     parser.add_argument("--benchmark", default="humaneval_plus")
     parser.add_argument("--bench-root", default="tasks_bench", type=Path)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--baseline-mode", default="A")
+    parser.add_argument("--baseline-k", type=int, default=1)
     parser.add_argument("--base-mode", default="C")
     parser.add_argument("--base-k", type=int, default=3)
     parser.add_argument("--candidate-mode", default="D_val")
     parser.add_argument("--candidate-k", type=int, default=3)
+    parser.add_argument("--public-timeout", type=int, default=10)
     parser.add_argument("--hidden-timeout", type=int, default=360)
     parser.add_argument("--score-policy", choices=["rescore", "reuse"], default="rescore")
     parser.add_argument("--save-artifacts", action="store_true")
@@ -318,7 +397,7 @@ def main() -> int:
     logger = JsonlLogger(args.out_log)
 
     written = skipped = missing = 0
-    selected_counts: dict[str, int] = {"base": 0, "candidate": 0, "none": 0}
+    selected_counts: dict[str, int] = {"baseline": 0, "base": 0, "candidate": 0, "none": 0}
     hidden_results: list[bool] = []
     for seed in seeds:
         for task_dir in tasks:
@@ -327,13 +406,21 @@ def main() -> int:
                 continue
             base_row = by_key.get((task_dir.name, args.base_mode, args.base_k, seed))
             candidate_row = by_key.get((task_dir.name, args.candidate_mode, args.candidate_k, seed))
-            if base_row is None and candidate_row is None:
+            baseline_row = by_key.get((task_dir.name, args.baseline_mode, args.baseline_k, seed))
+            if baseline_row is None and base_row is None and candidate_row is None:
                 missing += 1
                 continue
-            selected_kind, reason = choose_visible_guard(base_row, candidate_row)
+            selected_kind, reason, baseline_row = choose_visible_guard_with_baseline(
+                task_dir,
+                baseline_row,
+                base_row,
+                candidate_row,
+                args.public_timeout,
+            )
             selected_counts[selected_kind] = selected_counts.get(selected_kind, 0) + 1
             record = build_selected_record(
                 task_dir=task_dir,
+                baseline_row=baseline_row,
                 base_row=base_row,
                 candidate_row=candidate_row,
                 selected_kind=selected_kind,

@@ -62,7 +62,7 @@ class Sandbox:
                 env={
                     **os.environ,
                     "PYTHONDONTWRITEBYTECODE": "1",
-                    "PYTHONINTMAXSTRDIGITS": "1000000",
+                    "PYTHONINTMAXSTRDIGITS": "0",
                     "PYTHONHASHSEED": "0",
                 },
             )
@@ -110,7 +110,7 @@ def score_hidden(task_dir: Path, sandbox: Sandbox, timeout: int = DEFAULT_CMD_TI
             env={
                 **os.environ,
                 "PYTHONDONTWRITEBYTECODE": "1",
-                "PYTHONINTMAXSTRDIGITS": "1000000",
+                "PYTHONINTMAXSTRDIGITS": "0",
                 "PYTHONHASHSEED": "0",
             },
         )
@@ -155,7 +155,7 @@ def score_self_tests_on_reference(
             env={
                 **os.environ,
                 "PYTHONDONTWRITEBYTECODE": "1",
-                "PYTHONINTMAXSTRDIGITS": "1000000",
+                "PYTHONINTMAXSTRDIGITS": "0",
                 "PYTHONHASHSEED": "0",
             },
         )

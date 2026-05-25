@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import copy
 import re
+import runpy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -1018,6 +1019,12 @@ def _reference_self_test_rejection_reason(
         return None, None, None, False
     reference_passed = reference_result.returncode == 0
     if reference_passed:
+        strict_reason, strict_result = _strict_reference_assertion_rejection_reason(
+            task_dir,
+            sandbox.read("self_tests.py"),
+        )
+        if strict_reason is not None:
+            return strict_reason, strict_result, False, True
         return None, reference_result, True, True
     return (
         "self_tests.py failed against trusted reference_solution.py.\n\n"
@@ -1029,6 +1036,126 @@ def _reference_self_test_rejection_reason(
         False,
         True,
     )
+
+
+def _call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "solution"
+    ):
+        return node.attr
+    return None
+
+
+def _literal_call_assertion(
+    node: ast.Assert,
+) -> tuple[str, list[object], dict[str, object], object] | None:
+    test = node.test
+    if not (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1
+        and len(test.comparators) == 1
+        and isinstance(test.ops[0], (ast.Eq, ast.Is))
+    ):
+        return None
+
+    pairs = ((test.left, test.comparators[0]), (test.comparators[0], test.left))
+    for call_node, expected_node in pairs:
+        if not isinstance(call_node, ast.Call):
+            continue
+        name = _call_name(call_node.func)
+        if name is None:
+            continue
+        try:
+            args = [ast.literal_eval(arg) for arg in call_node.args]
+            kwargs = {
+                kw.arg: ast.literal_eval(kw.value)
+                for kw in call_node.keywords
+                if kw.arg is not None
+            }
+            expected = ast.literal_eval(expected_node)
+        except (SyntaxError, TypeError, ValueError):
+            continue
+        return name, args, kwargs, expected
+    return None
+
+
+def _strict_reference_assertion_rejection_reason(
+    task_dir: Path,
+    self_tests: str,
+) -> tuple[str | None, RunResult | None]:
+    """Catch pytest equality cases where reference passes but types are wrong.
+
+    Pytest treats `False == 0` as true, while the EvalPlus hidden comparator
+    distinguishes booleans from numbers. This extra reference check is narrow:
+    it only inspects simple literal assertions and rejects bool/int-equivalent
+    expected values that would otherwise pass against reference_solution.py.
+    """
+    reference = task_dir / "reference_solution.py"
+    if not reference.exists():
+        return None, None
+
+    try:
+        tree = ast.parse(self_tests)
+    except SyntaxError:
+        return None, None
+
+    try:
+        reference_globals = runpy.run_path(str(reference))
+    except Exception as e:
+        return (
+            f"trusted reference_solution.py could not be loaded for strict checks: {e}",
+            RunResult(1, "", str(e), False),
+        )
+
+    target_symbols = _target_symbols_from_public_tests(task_dir)
+    failures: list[str] = []
+    for top_level in tree.body:
+        if not isinstance(top_level, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not top_level.name.startswith("test_"):
+            continue
+        for node in ast.walk(top_level):
+            if not isinstance(node, ast.Assert):
+                continue
+            assertion = _literal_call_assertion(node)
+            if assertion is None:
+                continue
+            name, args, kwargs, expected = assertion
+            if target_symbols and name not in target_symbols:
+                continue
+            func = reference_globals.get(name)
+            if not callable(func):
+                continue
+            try:
+                actual = func(*args, **kwargs)
+            except Exception:
+                continue
+            if not (isinstance(actual, bool) or isinstance(expected, bool)):
+                continue
+            if actual is expected:
+                continue
+            failures.append(
+                "FAILED self_tests.py::"
+                f"{top_level.name}\n"
+                f"strict reference mismatch: {name} returned "
+                f"{actual!r} ({type(actual).__name__}) for args={args!r}, "
+                f"but the test expected {expected!r} ({type(expected).__name__})."
+            )
+
+    if not failures:
+        return None, None
+
+    output = "\n".join(failures)
+    reason = (
+        "self_tests.py passed normal pytest against reference_solution.py, but "
+        "strict reference checking found bool/int-equivalent expected values.\n\n"
+        + output
+    )
+    return reason, RunResult(1, output, "", False)
 
 
 FAILED_TEST_RE = re.compile(r"FAILED\s+self_tests\.py::([A-Za-z_]\w*)\b")
