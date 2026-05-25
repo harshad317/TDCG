@@ -311,3 +311,15 @@ is the next milestone.
 ## Gate
 If `C(k=5) - A(k=1) >= 15 percentage points` over the pilot set, expand to
 modes D/D_sep/D_dual/D_val + E and scale to more tasks / model sizes.
+
+## Results
+
+HumanEval+ (164 tasks), `qwen2.5-coder:7b`, batch `humaneval_plus_full_v3`:
+
+| Mode      | k | Hidden pass | Pass rate | Δ vs A/k=1 |
+|-----------|---|-------------|-----------|------------|
+| A         | 1 | 133/164     | 81.10%    | —          |
+| C         | 3 | 139/164     | 84.76%    | +3.66 pp   |
+| D_val     | 3 | 141/164     | 85.98%    | +4.88 pp   |
+
+See [RESULTS.md](RESULTS.md) for run command and provenance.
