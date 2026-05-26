@@ -320,7 +320,7 @@ HumanEval+ (164 tasks), `qwen2.5-coder:7b`, batch `humaneval_plus_full_v3`:
 | Mode      | k | Hidden pass | Pass rate | Δ vs A/k=1 |
 |-----------|---|-------------|-----------|------------|
 | A         | 1 | 119/164     | 72.56%    | —          |
-| C         | 3 | 139/164     | 84.76%    | +3.66 pp   |
-| D_val     | 3 | 141/164     | 85.98%    | +4.88 pp   |
+| C         | 3 | 139/164     | 84.76%    | +12.19 pp  |
+| D_val     | 3 | 141/164     | 85.98%    | +13.41 pp  |
 
 See [RESULTS.md](RESULTS.md) for run command and provenance.
