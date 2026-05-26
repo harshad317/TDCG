@@ -3,6 +3,8 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 .claude/
+node_modules/
+outputs/
 results/*.jsonl
 results/*.console.log
 results/plots/
