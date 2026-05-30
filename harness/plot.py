@@ -1,20 +1,9 @@
-"""Generate plots from results/runs.jsonl.
+"""Generate useful plots from JSONL benchmark logs.
 
-Saves PNGs into results/plots/<batch_tag>/ so each batch's view is preserved.
-
-Plots produced (only those that have data):
-  1. pass_rate_by_mode_k.png        — bar chart, pass@1 on hidden tests per (mode, k)
-  2. baseline_vs_tests.png          — no tests (A) vs public-test feedback (C)
-  3. baseline_vs_self_tests.png     — no tests (A) vs model-written tests (D)
-  4. baseline_vs_separate_self_tests.png — no tests (A) vs separated self-test loop (D_sep)
-  5. baseline_vs_dual_self_tests.png — no tests (A) vs two-model self-test loop (D_dual)
-  6. baseline_vs_validated_self_tests.png — no tests (A) vs validated self-test loop (D_val)
-  7. pass_rate_vs_iterations.png    — line plot, k-sweep for exec modes
-  8. repair_outcomes.png            — hidden-fail to hidden-pass after self-test feedback
-  9. overfit_rate_by_mode.png       — visible-pass-but-hidden-fail rate per (mode, k)
-  10. tokens_vs_pass.png             — scatter, output tokens vs hidden pass
-  11. delta_by_model_size.png       — only when multiple models present
-  12. per_task_heatmap.png          — task x mode_k grid of pass/fail
+The plotting layer is intentionally coverage-aware:
+- append-only logs are deduplicated to the latest row per task/mode/k/seed;
+- rerun gains compare the first and latest row for each run key;
+- incomplete baselines are not plotted as headline comparisons.
 """
 from __future__ import annotations
 
@@ -22,7 +11,7 @@ import json
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Callable
 
 from .analysis import build_ablation_summary
 
@@ -30,6 +19,35 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+
+
+MODE_ORDER = {
+    "A": 0,
+    "B": 1,
+    "C": 2,
+    "D": 3,
+    "D_sep": 4,
+    "D_dual": 5,
+    "D_val": 6,
+    "E": 7,
+    "P_select": 8,
+    "X_codex": 9,
+    "X_claude": 10,
+}
+MODE_COLORS = {
+    "A": "#94a3b8",
+    "B": "#f59e0b",
+    "C": "#3b82f6",
+    "D": "#10b981",
+    "D_sep": "#14b8a6",
+    "D_dual": "#0f766e",
+    "D_val": "#15803d",
+    "E": "#a855f7",
+    "P_select": "#64748b",
+    "X_codex": "#111827",
+    "X_claude": "#f97316",
+}
 
 
 def load(jsonl_path: Path) -> list[dict]:
@@ -37,23 +55,92 @@ def load(jsonl_path: Path) -> list[dict]:
     with jsonl_path.open() as f:
         for line in f:
             line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
+            if line:
+                rows.append(json.loads(line))
     return rows
 
 
-def filter_rows(
+def _filter_raw_rows(
     rows: list[dict],
     model: str | None = None,
     batch_tag: str | None = None,
+    seed: int | None = None,
 ) -> list[dict]:
     out = rows
     if model:
         out = [r for r in out if r.get("model") == model]
     if batch_tag:
         out = [r for r in out if (r.get("extra") or {}).get("batch_tag") == batch_tag]
+    if seed is not None:
+        out = [r for r in out if int(r.get("seed", 0)) == seed]
     return out
+
+
+def filter_rows(
+    rows: list[dict],
+    model: str | None = None,
+    batch_tag: str | None = None,
+    seed: int | None = None,
+) -> list[dict]:
+    return _latest_rows_by_run_key(_filter_raw_rows(rows, model=model, batch_tag=batch_tag, seed=seed))
+
+
+def _run_key(row: dict) -> tuple | None:
+    try:
+        extra = row.get("extra") or {}
+        batch = extra.get("batch_tag")
+        if batch is None:
+            return None
+        return (
+            batch,
+            row["model"],
+            row["task_id"],
+            row["mode"],
+            int(row["k"]),
+            int(row.get("seed", 0)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _latest_rows_by_run_key(rows: list[dict]) -> list[dict]:
+    latest: dict[tuple, dict] = {}
+    latest_index: dict[tuple, int] = {}
+    unkeyed: list[tuple[int, dict]] = []
+    for index, row in enumerate(rows):
+        key = _run_key(row)
+        if key is None:
+            unkeyed.append((index, row))
+            continue
+        latest[key] = row
+        latest_index[key] = index
+
+    keyed = [(latest_index[key], row) for key, row in latest.items()]
+    return [row for _, row in sorted(unkeyed + keyed, key=lambda item: item[0])]
+
+
+def _first_and_latest_by_run_key(rows: list[dict]) -> tuple[dict[tuple, dict], dict[tuple, dict]]:
+    first: dict[tuple, dict] = {}
+    latest: dict[tuple, dict] = {}
+    for row in rows:
+        key = _run_key(row)
+        if key is None:
+            continue
+        first.setdefault(key, row)
+        latest[key] = row
+    return first, latest
+
+
+def _task_sort_key(task_id: str) -> tuple[int, str]:
+    try:
+        return int(task_id.rsplit("_", 1)[1]), task_id
+    except (IndexError, ValueError):
+        return 10**9, task_id
+
+
+def _mode_k_sort_key(key: tuple[str, int]) -> tuple[int, int, str]:
+    mode, k = key
+    return MODE_ORDER.get(mode, 99), int(k), mode
 
 
 def _label(mode: str, k: int) -> str:
@@ -61,306 +148,225 @@ def _label(mode: str, k: int) -> str:
 
 
 def _group_pass_rate(rows: list[dict]) -> dict[tuple[str, int], tuple[int, int]]:
-    """Returns {(mode,k): (passed, total)}."""
     agg: dict[tuple[str, int], list[int]] = defaultdict(lambda: [0, 0])
-    for r in rows:
-        if r.get("passed_hidden") is None:
+    for row in rows:
+        if row.get("passed_hidden") is None:
             continue
-        key = (r["mode"], r["k"])
+        key = (row["mode"], int(row["k"]))
         agg[key][1] += 1
-        if r["passed_hidden"]:
+        if row.get("passed_hidden") is True:
             agg[key][0] += 1
-    return {k: (v[0], v[1]) for k, v in agg.items()}
+    return {key: (value[0], value[1]) for key, value in agg.items()}
+
+
+def _model_mode_k_sort_key(key: tuple[str, str, int]) -> tuple[str, int, int, str]:
+    model, mode, k = key
+    return model.lower(), MODE_ORDER.get(mode, 99), int(k), mode
+
+
+def plot_pass_rate_by_model_mode_k(rows: list[dict], out_path: Path) -> None:
+    if len({row["model"] for row in rows}) < 2:
+        return
+    grouped: dict[tuple[str, str, int], list[int]] = defaultdict(lambda: [0, 0])
+    for row in rows:
+        if row.get("passed_hidden") is None:
+            continue
+        key = (row["model"], row["mode"], int(row["k"]))
+        grouped[key][1] += 1
+        grouped[key][0] += int(row.get("passed_hidden") is True)
+    if not grouped:
+        return
+
+    keys = sorted(grouped, key=_model_mode_k_sort_key)
+    labels = [f"{model} | {_label(mode, k)}" for model, mode, k in keys]
+    rates = [grouped[key][0] / grouped[key][1] * 100 for key in keys]
+    text = [
+        f"{passed}/{total} ({passed / total * 100:.1f}%)"
+        for passed, total in (grouped[key] for key in keys)
+    ]
+
+    fig, ax = plt.subplots(figsize=(11, max(4.2, len(keys) * 0.5)))
+    y = list(range(len(keys)))
+    bars = ax.barh(
+        y,
+        rates,
+        color=[MODE_COLORS.get(mode, "#3b82f6") for _, mode, _ in keys],
+    )
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("hidden pass rate (%)")
+    ax.set_xlim(0, 108)
+    ax.set_title("Latest hidden pass rate by model and mode/k")
+    ax.grid(True, axis="x", alpha=0.25)
+    _bar_text(ax, bars, text, fontsize=8)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def _row_visible_passed(row: dict) -> bool:
+    mode = row.get("mode")
+    required: list[bool | None] = []
+    if mode in ("C", "D_val", "E", "P_select") or str(mode).startswith("X_"):
+        required.append(row.get("passed_public"))
+    if mode in ("D", "D_sep", "D_dual", "D_val", "E"):
+        required.append(row.get("passed_self"))
+    return bool(required) and all(value is True for value in required)
+
+
+def _bar_text(ax, bars, labels: list[str], *, fontsize: int = 9) -> None:
+    for bar, label in zip(bars, labels):
+        ax.text(
+            bar.get_width() + 0.8,
+            bar.get_y() + bar.get_height() / 2,
+            label,
+            va="center",
+            ha="left",
+            fontsize=fontsize,
+        )
 
 
 def plot_pass_rate_by_mode_k(rows: list[dict], out_path: Path) -> None:
     grouped = _group_pass_rate(rows)
     if not grouped:
         return
-    keys = sorted(grouped.keys(), key=lambda x: (x[0], x[1]))
-    labels = [_label(m, k) for m, k in keys]
-    rates = [grouped[k][0] / grouped[k][1] if grouped[k][1] else 0.0 for k in keys]
+    keys = sorted(grouped, key=_mode_k_sort_key)
+    labels = [_label(*key) for key in keys]
+    rates = [grouped[key][0] / grouped[key][1] * 100 for key in keys]
+    text = [
+        f"{passed}/{total} ({passed / total * 100:.1f}%)"
+        for passed, total in (grouped[key] for key in keys)
+    ]
 
-    fig, ax = plt.subplots(figsize=(max(6, len(keys) * 0.8), 4))
-    bars = ax.bar(labels, [r * 100 for r in rates], color="#3b82f6")
-    ax.set_ylabel("hidden pass rate (%)")
-    ax.set_ylim(0, 100)
-    ax.set_title("Hidden test pass rate by mode/k")
-    for bar, (m, k) in zip(bars, keys):
-        passed, total = grouped[(m, k)]
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + 1,
-            f"{passed}/{total}",
-            ha="center",
-            fontsize=8,
-        )
-    plt.xticks(rotation=30, ha="right")
+    fig, ax = plt.subplots(figsize=(9, max(3.8, len(keys) * 0.55)))
+    y = list(range(len(keys)))
+    bars = ax.barh(
+        y,
+        rates,
+        color=[MODE_COLORS.get(mode, "#3b82f6") for mode, _ in keys],
+    )
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("hidden pass rate (%)")
+    ax.set_xlim(0, 108)
+    ax.set_title("Latest hidden pass rate by mode/k")
+    ax.grid(True, axis="x", alpha=0.25)
+    _bar_text(ax, bars, text)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=160)
     plt.close(fig)
 
 
-def plot_baseline_vs_tests(rows: list[dict], out_path: Path) -> None:
-    """Simple headline chart: Mode A/k=1 vs Mode C at the largest available k.
-
-    A is the no-test/no-execution baseline. C is public tests + execution
-    feedback. This is the cleanest first read of the hypothesis.
-    """
-    scored = [r for r in rows if r.get("passed_hidden") is not None]
-    if not scored:
+def plot_failure_count_by_mode(rows: list[dict], out_path: Path) -> None:
+    grouped: dict[tuple[str, int], dict[str, int]] = defaultdict(
+        lambda: {"pass": 0, "fail": 0, "timeout": 0, "unscored": 0}
+    )
+    for row in rows:
+        key = (row["mode"], int(row["k"]))
+        if row.get("passed_hidden") is True:
+            grouped[key]["pass"] += 1
+        elif row.get("passed_hidden") is False:
+            if (row.get("extra") or {}).get("hidden_timed_out") is True:
+                grouped[key]["timeout"] += 1
+            else:
+                grouped[key]["fail"] += 1
+        else:
+            grouped[key]["unscored"] += 1
+    if not grouped:
         return
 
-    comparisons = []
-    for model in sorted({r["model"] for r in scored}):
-        sub = [r for r in scored if r["model"] == model]
-        grouped = _group_pass_rate(sub)
-        baseline = grouped.get(("A", 1))
-        c_keys = sorted((key for key in grouped if key[0] == "C"), key=lambda x: x[1])
-        if not baseline or not c_keys:
-            continue
-        test_key = c_keys[-1]
-        comparisons.append((model, baseline, test_key, grouped[test_key]))
-    if not comparisons:
-        return
+    keys = sorted(grouped, key=_mode_k_sort_key)
+    labels = [_label(*key) for key in keys]
+    y = list(range(len(keys)))
+    pass_counts = [grouped[key]["pass"] for key in keys]
+    fail_counts = [grouped[key]["fail"] for key in keys]
+    timeout_counts = [grouped[key]["timeout"] for key in keys]
+    unscored_counts = [grouped[key]["unscored"] for key in keys]
 
-    fig, ax = plt.subplots(figsize=(max(6, len(comparisons) * 2.2), 4.5))
-    colors = ["#94a3b8", "#2563eb"]
-
-    if len(comparisons) == 1:
-        model, baseline, test_key, with_tests = comparisons[0]
-        values = [
-            baseline[0] / baseline[1] * 100 if baseline[1] else 0,
-            with_tests[0] / with_tests[1] * 100 if with_tests[1] else 0,
-        ]
-        labels = ["No tests\nA/k=1", f"With tests\nC/k={test_key[1]}"]
-        bars = ax.bar(labels, values, color=colors, width=0.55)
-        for bar, (passed, total) in zip(bars, [baseline, with_tests]):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 1,
-                f"{passed}/{total}",
-                ha="center",
-                fontsize=9,
-            )
-        delta = values[1] - values[0]
-        ax.text(
-            0.5,
-            max(values) + 8,
-            f"lift: {delta:+.1f} percentage points",
-            ha="center",
-            fontsize=10,
-            fontweight="bold",
-        )
-        ax.set_title(f"No tests vs public-test feedback\n{model}")
-    else:
-        x = list(range(len(comparisons)))
-        width = 0.36
-        baseline_rates = []
-        with_test_rates = []
-        for _, baseline, _, with_tests in comparisons:
-            baseline_rates.append(baseline[0] / baseline[1] * 100 if baseline[1] else 0)
-            with_test_rates.append(with_tests[0] / with_tests[1] * 100 if with_tests[1] else 0)
-        bars_a = ax.bar([i - width / 2 for i in x], baseline_rates, width, label="No tests (A/k=1)", color=colors[0])
-        bars_c = ax.bar([i + width / 2 for i in x], with_test_rates, width, label="With tests (C/k=max)", color=colors[1])
-        for bars, pairs in ((bars_a, [c[1] for c in comparisons]), (bars_c, [c[3] for c in comparisons])):
-            for bar, (passed, total) in zip(bars, pairs):
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 1,
-                    f"{passed}/{total}",
-                    ha="center",
-                    fontsize=8,
-                )
-        ax.set_xticks(x)
-        ax.set_xticklabels([c[0] for c in comparisons], rotation=20, ha="right")
-        ax.legend()
-        ax.set_title("No tests vs public-test feedback")
-
-    ax.set_ylabel("hidden pass rate on benchmark (%)")
-    ax.set_ylim(0, 100)
-    ax.grid(True, axis="y", alpha=0.25)
+    fig, ax = plt.subplots(figsize=(9, max(3.8, len(keys) * 0.55)))
+    left = [0] * len(keys)
+    ax.barh(y, pass_counts, left=left, color="#16a34a", label="hidden pass")
+    left = [a + b for a, b in zip(left, pass_counts)]
+    ax.barh(y, fail_counts, left=left, color="#ef4444", label="hidden fail")
+    left = [a + b for a, b in zip(left, fail_counts)]
+    ax.barh(y, timeout_counts, left=left, color="#f97316", label="hidden timeout")
+    left = [a + b for a, b in zip(left, timeout_counts)]
+    ax.barh(y, unscored_counts, left=left, color="#94a3b8", label="unscored")
+    totals = [sum(grouped[key].values()) for key in keys]
+    for idx, total in enumerate(totals):
+        bad = fail_counts[idx] + timeout_counts[idx] + unscored_counts[idx]
+        ax.text(total + 0.8, idx, f"{bad} not pass / {total}", va="center", fontsize=9)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("run count")
+    ax.set_title("Pass/fail/timeout counts by mode/k")
+    ax.legend(loc="lower right")
+    ax.grid(True, axis="x", alpha=0.2)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=160)
     plt.close(fig)
 
 
-def plot_baseline_vs_self_tests(rows: list[dict], out_path: Path) -> None:
-    """Headline chart for the self-test hypothesis: Mode A/k=1 vs Mode D/k=max.
-
-    A is one-shot code with no tests. D is model-written tests plus execution
-    feedback, iterating until the model's own tests pass or the budget ends.
-    """
-    _plot_baseline_vs_mode(
-        rows=rows,
-        out_path=out_path,
-        compared_mode="D",
-        compared_label="With self-tests",
-        compared_detail="D/k=max",
-        title="No tests vs model-written self-test loop",
-        color="#10b981",
-    )
-
-
-def plot_baseline_vs_separate_self_tests(rows: list[dict], out_path: Path) -> None:
-    """Headline chart for separated self-tests: Mode A/k=1 vs Mode D_sep/k=max."""
-    _plot_baseline_vs_mode(
-        rows=rows,
-        out_path=out_path,
-        compared_mode="D_sep",
-        compared_label="With separate self-tests",
-        compared_detail="D_sep/k=max",
-        title="No tests vs separated self-test loop",
-        color="#14b8a6",
-    )
-
-
-def plot_baseline_vs_dual_self_tests(rows: list[dict], out_path: Path) -> None:
-    """Headline chart for two-model self-tests: Mode A/k=1 vs Mode D_dual/k=max."""
-    _plot_baseline_vs_mode(
-        rows=rows,
-        out_path=out_path,
-        compared_mode="D_dual",
-        compared_label="With dual self-tests",
-        compared_detail="D_dual/k=max",
-        title="No tests vs two-model self-test loop",
-        color="#0f766e",
-    )
-
-
-def plot_baseline_vs_validated_self_tests(rows: list[dict], out_path: Path) -> None:
-    """Headline chart for validated self-tests: Mode A/k=1 vs Mode D_val/k=max."""
-    _plot_baseline_vs_mode(
-        rows=rows,
-        out_path=out_path,
-        compared_mode="D_val",
-        compared_label="With validated self-tests",
-        compared_detail="D_val/k=max",
-        title="No tests vs validated self-test loop",
-        color="#15803d",
-    )
-
-
-def _plot_baseline_vs_mode(
-    rows: list[dict],
-    out_path: Path,
-    compared_mode: str,
-    compared_label: str,
-    compared_detail: str,
-    title: str,
-    color: str,
-) -> None:
-    scored = [r for r in rows if r.get("passed_hidden") is not None]
-    if not scored:
+def plot_rerun_gain_by_mode(raw_rows: list[dict], out_path: Path) -> None:
+    first, latest = _first_and_latest_by_run_key(raw_rows)
+    duplicated_keys = {key for key in latest if key in first and latest[key] is not first[key]}
+    if not duplicated_keys:
         return
 
-    comparisons = []
-    for model in sorted({r["model"] for r in scored}):
-        sub = [r for r in scored if r["model"] == model]
-        grouped = _group_pass_rate(sub)
-        baseline = grouped.get(("A", 1))
-        compared_keys = sorted((key for key in grouped if key[0] == compared_mode), key=lambda x: x[1])
-        if not baseline or not compared_keys:
+    grouped: dict[tuple[str, int], dict[str, int]] = defaultdict(
+        lambda: {"first_pass": 0, "latest_pass": 0, "total": 0}
+    )
+    for key in duplicated_keys:
+        first_row = first[key]
+        latest_row = latest[key]
+        if first_row.get("passed_hidden") is None or latest_row.get("passed_hidden") is None:
             continue
-        compared_key = compared_keys[-1]
-        comparisons.append((model, baseline, compared_key, grouped[compared_key]))
-    if not comparisons:
+        group_key = (latest_row["mode"], int(latest_row["k"]))
+        grouped[group_key]["total"] += 1
+        grouped[group_key]["first_pass"] += int(first_row.get("passed_hidden") is True)
+        grouped[group_key]["latest_pass"] += int(latest_row.get("passed_hidden") is True)
+    grouped = {key: value for key, value in grouped.items() if value["total"]}
+    if not grouped:
         return
 
-    fig, ax = plt.subplots(figsize=(max(6, len(comparisons) * 2.2), 4.5))
-    colors = ["#94a3b8", color]
-
-    if len(comparisons) == 1:
-        model, baseline, compared_key, compared = comparisons[0]
-        values = [
-            baseline[0] / baseline[1] * 100 if baseline[1] else 0,
-            compared[0] / compared[1] * 100 if compared[1] else 0,
-        ]
-        labels = ["No tests\nA/k=1", f"{compared_label}\n{compared_mode}/k={compared_key[1]}"]
-        bars = ax.bar(labels, values, color=colors, width=0.55)
-        for bar, (passed, total) in zip(bars, [baseline, compared]):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 1,
-                f"{passed}/{total}",
-                ha="center",
-                fontsize=9,
-            )
-        delta = values[1] - values[0]
+    keys = sorted(grouped, key=_mode_k_sort_key)
+    labels = [_label(*key) for key in keys]
+    first_rates = [
+        grouped[key]["first_pass"] / grouped[key]["total"] * 100
+        for key in keys
+    ]
+    latest_rates = [
+        grouped[key]["latest_pass"] / grouped[key]["total"] * 100
+        for key in keys
+    ]
+    x = list(range(len(keys)))
+    width = 0.36
+    fig, ax = plt.subplots(figsize=(max(7, len(keys) * 1.2), 4.5))
+    bars_a = ax.bar([i - width / 2 for i in x], first_rates, width, color="#cbd5e1", label="first row")
+    bars_b = ax.bar([i + width / 2 for i in x], latest_rates, width, color="#2563eb", label="latest row")
+    for i, key in enumerate(keys):
+        data = grouped[key]
+        delta = data["latest_pass"] - data["first_pass"]
         ax.text(
-            0.5,
-            max(values) + 8,
-            f"lift: {delta:+.1f} percentage points",
+            i,
+            max(first_rates[i], latest_rates[i]) + 3,
+            f"{delta:+d}/{data['total']}",
             ha="center",
-            fontsize=10,
-            fontweight="bold",
+            fontsize=9,
+            fontweight="bold" if delta else "normal",
         )
-        ax.set_title(f"{title}\n{model}")
-    else:
-        x = list(range(len(comparisons)))
-        width = 0.36
-        baseline_rates = []
-        compared_rates = []
-        for _, baseline, _, compared in comparisons:
-            baseline_rates.append(baseline[0] / baseline[1] * 100 if baseline[1] else 0)
-            compared_rates.append(compared[0] / compared[1] * 100 if compared[1] else 0)
-        bars_a = ax.bar([i - width / 2 for i in x], baseline_rates, width, label="No tests (A/k=1)", color=colors[0])
-        bars_b = ax.bar([i + width / 2 for i in x], compared_rates, width, label=f"{compared_label} ({compared_detail})", color=colors[1])
-        for bars, pairs in ((bars_a, [c[1] for c in comparisons]), (bars_b, [c[3] for c in comparisons])):
-            for bar, (passed, total) in zip(bars, pairs):
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 1,
-                    f"{passed}/{total}",
-                    ha="center",
-                    fontsize=8,
-                )
-        ax.set_xticks(x)
-        ax.set_xticklabels([c[0] for c in comparisons], rotation=20, ha="right")
-        ax.legend()
-        ax.set_title(title)
-
-    ax.set_ylabel("hidden pass rate on benchmark (%)")
-    ax.set_ylim(0, 100)
-    ax.grid(True, axis="y", alpha=0.25)
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def plot_pass_rate_vs_iterations(rows: list[dict], out_path: Path) -> None:
-    grouped = _group_pass_rate(rows)
-    by_mode: dict[str, list[tuple[int, float]]] = defaultdict(list)
-    for (mode, k), (p, t) in grouped.items():
-        if t == 0:
-            continue
-        by_mode[mode].append((k, p / t * 100))
-    if not by_mode:
-        return
-    fig, ax = plt.subplots(figsize=(7, 4))
-    colors = {
-        "A": "#94a3b8",
-        "B": "#f59e0b",
-        "C": "#3b82f6",
-        "D": "#10b981",
-        "D_sep": "#14b8a6",
-        "D_dual": "#0f766e",
-        "D_val": "#15803d",
-        "E": "#a855f7",
-    }
-    for mode, pts in sorted(by_mode.items()):
-        pts.sort()
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        ax.plot(xs, ys, marker="o", label=f"mode {mode}", color=colors.get(mode))
-    ax.set_xlabel("k (max iterations)")
-    ax.set_ylabel("hidden pass rate (%)")
-    ax.set_ylim(0, 100)
-    ax.set_title("Pass rate vs iterations")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right")
+    ax.set_ylabel("pass rate on rerun slice (%)")
+    ax.set_ylim(0, 110)
+    ax.set_title("Rerun gain by mode/k")
     ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, axis="y", alpha=0.25)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=160)
     plt.close(fig)
 
 
@@ -384,193 +390,336 @@ def _repair_bucket(row: dict) -> str | None:
 
 
 def plot_repair_outcomes(rows: list[dict], out_path: Path) -> None:
-    buckets = ["fixed", "already pass", "not fixed", "regressed", "unknown"]
-    counts = {bucket: 0 for bucket in buckets}
-    for row in rows:
-        bucket = _repair_bucket(row)
-        if bucket is not None:
-            counts[bucket] += 1
-    if not any(counts.values()):
-        return
-
-    labels = [bucket for bucket in buckets if counts[bucket]]
-    values = [counts[bucket] for bucket in labels]
+    buckets = ["already pass", "fixed", "not fixed", "regressed", "unknown"]
     colors = {
-        "fixed": "#10b981",
         "already pass": "#60a5fa",
+        "fixed": "#10b981",
         "not fixed": "#ef4444",
         "regressed": "#f59e0b",
         "unknown": "#94a3b8",
     }
-    fig, ax = plt.subplots(figsize=(max(6, len(labels) * 1.4), 4))
-    bars = ax.bar(labels, values, color=[colors[label] for label in labels])
-    ax.set_ylabel("run count")
-    ax.set_title("Did self-test feedback repair hidden failures?")
-    total = sum(values)
-    for bar, value in zip(bars, values):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + 0.05,
-            f"{value}/{total}",
-            ha="center",
-            fontsize=9,
-        )
-    plt.xticks(rotation=20, ha="right")
+    grouped: dict[tuple[str, int], dict[str, int]] = defaultdict(
+        lambda: {bucket: 0 for bucket in buckets}
+    )
+    for row in rows:
+        bucket = _repair_bucket(row)
+        if bucket:
+            grouped[(row["mode"], int(row["k"]))][bucket] += 1
+    grouped = {key: value for key, value in grouped.items() if sum(value.values())}
+    if not grouped:
+        return
+
+    keys = sorted(grouped, key=_mode_k_sort_key)
+    labels = [_label(*key) for key in keys]
+    y = list(range(len(keys)))
+    left = [0] * len(keys)
+    fig, ax = plt.subplots(figsize=(10, max(3.8, len(keys) * 0.55)))
+    for bucket in buckets:
+        values = [grouped[key][bucket] for key in keys]
+        ax.barh(y, values, left=left, color=colors[bucket], label=bucket)
+        left = [a + b for a, b in zip(left, values)]
+    for idx, key in enumerate(keys):
+        total = sum(grouped[key].values())
+        fixed = grouped[key]["fixed"]
+        ax.text(total + 0.8, idx, f"fixed {fixed}/{total}", va="center", fontsize=9)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("run count")
+    ax.set_title("Repair outcome by mode/k")
+    ax.legend(loc="lower right")
+    ax.grid(True, axis="x", alpha=0.2)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_self_test_confusion(rows: list[dict], out_path: Path) -> None:
+    buckets = ["accepted_good", "missed_bug", "false_alarm", "caught_bug", "not_scored"]
+    colors = {
+        "accepted_good": "#16a34a",
+        "missed_bug": "#dc2626",
+        "false_alarm": "#f59e0b",
+        "caught_bug": "#2563eb",
+        "not_scored": "#94a3b8",
+    }
+    grouped: dict[tuple[str, int], dict[str, int]] = defaultdict(
+        lambda: {bucket: 0 for bucket in buckets}
+    )
+    for row in rows:
+        if row.get("mode") not in ("D", "D_sep", "D_dual", "D_val", "E"):
+            continue
+        key = (row["mode"], int(row["k"]))
+        self_passed = row.get("passed_self")
+        hidden_passed = row.get("passed_hidden")
+        if self_passed is None or hidden_passed is None:
+            bucket = "not_scored"
+        elif self_passed is True and hidden_passed is True:
+            bucket = "accepted_good"
+        elif self_passed is True and hidden_passed is False:
+            bucket = "missed_bug"
+        elif self_passed is False and hidden_passed is True:
+            bucket = "false_alarm"
+        else:
+            bucket = "caught_bug"
+        grouped[key][bucket] += 1
+    grouped = {key: value for key, value in grouped.items() if sum(value.values())}
+    if not grouped:
+        return
+
+    keys = sorted(grouped, key=_mode_k_sort_key)
+    labels = [_label(*key) for key in keys]
+    y = list(range(len(keys)))
+    left = [0] * len(keys)
+    fig, ax = plt.subplots(figsize=(10, max(3.8, len(keys) * 0.55)))
+    for bucket in buckets:
+        values = [grouped[key][bucket] for key in keys]
+        ax.barh(y, values, left=left, color=colors[bucket], label=bucket.replace("_", " "))
+        left = [a + b for a, b in zip(left, values)]
+    for idx, key in enumerate(keys):
+        data = grouped[key]
+        accepted = data["accepted_good"] + data["missed_bug"]
+        precision = data["accepted_good"] / accepted * 100 if accepted else 0
+        ax.text(sum(data.values()) + 0.8, idx, f"self-pass precision {precision:.1f}%", va="center", fontsize=9)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("run count")
+    ax.set_title("Self-test signal vs hidden outcome")
+    ax.legend(loc="lower right")
+    ax.grid(True, axis="x", alpha=0.2)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=160)
     plt.close(fig)
 
 
 def plot_overfit_rate(rows: list[dict], out_path: Path) -> None:
-    agg: dict[tuple[str, int], list[int]] = defaultdict(lambda: [0, 0])
-    for r in rows:
-        if r.get("passed_hidden") is None:
+    grouped: dict[tuple[str, int], list[int]] = defaultdict(lambda: [0, 0])
+    for row in rows:
+        if row.get("passed_hidden") is None:
             continue
-        key = (r["mode"], r["k"])
-        visible_pass = _row_visible_passed(r)
-        agg[key][1] += 1
-        if visible_pass and not r["passed_hidden"]:
-            agg[key][0] += 1
-    keys = [k for k in sorted(agg.keys()) if agg[k][1] > 0]
-    if not keys:
+        if not _row_visible_passed(row):
+            continue
+        key = (row["mode"], int(row["k"]))
+        grouped[key][1] += 1
+        if row.get("passed_hidden") is False:
+            grouped[key][0] += 1
+    grouped = {key: value for key, value in grouped.items() if value[1]}
+    if not grouped:
         return
-    labels = [_label(m, k) for m, k in keys]
-    rates = [agg[k][0] / agg[k][1] * 100 for k in keys]
-    fig, ax = plt.subplots(figsize=(max(6, len(keys) * 0.8), 4))
-    bars = ax.bar(labels, rates, color="#ef4444")
-    ax.set_ylabel("overfit rate (%)")
-    ax.set_ylim(0, max(100, max(rates) + 5))
-    ax.set_title("Overfit: visible tests pass, hidden tests fail")
-    for bar, k in zip(bars, keys):
-        bad, tot = agg[k]
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + 0.5,
-            f"{bad}/{tot}",
-            ha="center",
-            fontsize=8,
-        )
-    plt.xticks(rotation=30, ha="right")
+
+    keys = sorted(grouped, key=_mode_k_sort_key)
+    labels = [_label(*key) for key in keys]
+    rates = [grouped[key][0] / grouped[key][1] * 100 for key in keys]
+    text = [f"{bad}/{visible}" for bad, visible in (grouped[key] for key in keys)]
+    fig, ax = plt.subplots(figsize=(9, max(3.8, len(keys) * 0.55)))
+    y = list(range(len(keys)))
+    bars = ax.barh(y, rates, color="#ef4444")
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("visible-pass rows that fail hidden (%)")
+    ax.set_xlim(0, max(20, max(rates) + 8))
+    ax.set_title("Overfit rate among visible-passing rows")
+    ax.grid(True, axis="x", alpha=0.25)
+    _bar_text(ax, bars, text)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=160)
     plt.close(fig)
 
 
-def _row_visible_passed(row: dict) -> bool:
-    mode = row.get("mode")
-    required = []
-    if mode in ("C", "E"):
-        required.append(row.get("passed_public"))
-    if mode in ("D", "D_sep", "D_dual", "D_val", "E"):
-        required.append(row.get("passed_self"))
-    return bool(required) and all(value is True for value in required)
-
-
 def plot_tokens_vs_pass(rows: list[dict], out_path: Path) -> None:
-    pts_pass_x = []
-    pts_pass_y = []
-    pts_fail_x = []
-    pts_fail_y = []
-    for r in rows:
-        if r.get("passed_hidden") is None:
-            continue
-        x = r.get("tokens_out", 0)
-        y_mode_k = f"{r['mode']}/k={r['k']}"
-        if r["passed_hidden"]:
-            pts_pass_x.append(x)
-            pts_pass_y.append(y_mode_k)
+    scored = [row for row in rows if row.get("passed_hidden") is not None]
+    if not scored:
+        return
+    keys = sorted({(row["mode"], int(row["k"])) for row in scored}, key=_mode_k_sort_key)
+    y_lookup = {key: idx for idx, key in enumerate(keys)}
+    pass_x: list[int] = []
+    pass_y: list[float] = []
+    fail_x: list[int] = []
+    fail_y: list[float] = []
+    for idx, row in enumerate(scored):
+        key = (row["mode"], int(row["k"]))
+        y = y_lookup[key] + ((idx % 7) - 3) * 0.025
+        tokens = max(1, int(row.get("tokens_out") or 1))
+        if row.get("passed_hidden") is True:
+            pass_x.append(tokens)
+            pass_y.append(y)
         else:
-            pts_fail_x.append(x)
-            pts_fail_y.append(y_mode_k)
-    if not pts_pass_x and not pts_fail_x:
+            fail_x.append(tokens)
+            fail_y.append(y)
+    fig, ax = plt.subplots(figsize=(9, max(4, len(keys) * 0.55)))
+    ax.scatter(pass_x, pass_y, color="#10b981", label="hidden pass", alpha=0.6, s=22)
+    ax.scatter(fail_x, fail_y, color="#ef4444", label="hidden fail", alpha=0.75, marker="x", s=30)
+    ax.set_xscale("log")
+    ax.set_yticks(range(len(keys)))
+    ax.set_yticklabels([_label(*key) for key in keys])
+    ax.invert_yaxis()
+    ax.set_xlabel("output tokens, log scale")
+    ax.set_title("Token spend vs hidden outcome")
+    ax.legend()
+    ax.grid(True, axis="x", alpha=0.25)
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_remaining_failures_heatmap(rows: list[dict], out_path: Path) -> None:
+    preferred_modes = ["D_sep", "D_dual", "D_val", "E"]
+    available_cols = [
+        (mode, 5)
+        for mode in preferred_modes
+        if any(row.get("mode") == mode and int(row.get("k", 0)) == 5 for row in rows)
+    ]
+    if not available_cols:
+        available_cols = sorted({(row["mode"], int(row["k"])) for row in rows}, key=_mode_k_sort_key)
+    row_by_task_col = {
+        (row["task_id"], row["mode"], int(row["k"])): row
+        for row in rows
+    }
+    tasks = sorted(
+        {
+            row["task_id"]
+            for row in rows
+            if any(
+                row_by_task_col.get((row["task_id"], mode, k), {}).get("passed_hidden") is not True
+                for mode, k in available_cols
+            )
+        },
+        key=_task_sort_key,
+    )
+    if not tasks:
+        return
+    grid: list[list[int]] = []
+    for task in tasks:
+        cells = []
+        for mode, k in available_cols:
+            row = row_by_task_col.get((task, mode, k))
+            if row is None or row.get("passed_hidden") is None:
+                cells.append(1)
+            elif row.get("passed_hidden") is True:
+                cells.append(2)
+            else:
+                cells.append(0)
+        grid.append(cells)
+
+    fig, ax = plt.subplots(figsize=(max(6, len(available_cols) * 1.15), max(5, len(tasks) * 0.28)))
+    cmap = ListedColormap(["#dc2626", "#cbd5e1", "#16a34a"])
+    ax.imshow(grid, cmap=cmap, vmin=0, vmax=2, aspect="auto")
+    ax.set_xticks(range(len(available_cols)))
+    ax.set_xticklabels([_label(*key) for key in available_cols], rotation=25, ha="right")
+    ax.set_yticks(range(len(tasks)))
+    ax.set_yticklabels(tasks, fontsize=8)
+    for i, row in enumerate(grid):
+        for j, value in enumerate(row):
+            label = "P" if value == 2 else ("F" if value == 0 else "-")
+            ax.text(j, i, label, ha="center", va="center", fontsize=7, color="black")
+    ax.set_title("Remaining failures by task (latest rows)")
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=170)
+    plt.close(fig)
+
+
+def plot_pass_rate_vs_iterations(rows: list[dict], out_path: Path) -> None:
+    grouped = _group_pass_rate(rows)
+    by_mode: dict[str, list[tuple[int, int, int]]] = defaultdict(list)
+    for (mode, k), (passed, total) in grouped.items():
+        by_mode[mode].append((k, passed, total))
+    by_mode = {
+        mode: sorted(points)
+        for mode, points in by_mode.items()
+        if len(points) >= 2 and len({total for _, _, total in points}) == 1
+    }
+    if not by_mode:
         return
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.scatter(pts_pass_x, pts_pass_y, color="#10b981", label="hidden PASS", alpha=0.7)
-    ax.scatter(pts_fail_x, pts_fail_y, color="#ef4444", label="hidden FAIL", alpha=0.7, marker="x")
-    ax.set_xlabel("output tokens (sum across iterations)")
-    ax.set_ylabel("mode/k")
-    ax.set_title("Tokens spent vs outcome")
+    for mode, points in sorted(by_mode.items(), key=lambda item: MODE_ORDER.get(item[0], 99)):
+        xs = [k for k, _, _ in points]
+        ys = [passed / total * 100 for _, passed, total in points]
+        ax.plot(xs, ys, marker="o", label=mode, color=MODE_COLORS.get(mode))
+    ax.set_xlabel("k (max iterations)")
+    ax.set_ylabel("hidden pass rate (%)")
+    ax.set_ylim(0, 100)
+    ax.set_title("Pass rate vs k (only complete k-sweeps)")
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=160)
     plt.close(fig)
 
 
 def plot_delta_by_model_size(rows: list[dict], out_path: Path) -> None:
-    """Delta (mode X k=max - mode A k=1) per model.
-
-    Useful once multiple models have data in the JSONL.
-    """
-    models = sorted({r["model"] for r in rows})
+    models = sorted({row["model"] for row in rows})
     if len(models) < 2:
         return
     fig, ax = plt.subplots(figsize=(7, 4))
     for mode in ["C", "D", "D_sep", "D_dual", "D_val", "E"]:
-        xs, ys = [], []
-        for m in models:
-            sub = [r for r in rows if r["model"] == m]
-            grp = _group_pass_rate(sub)
-            a_key = ("A", 1)
-            if a_key not in grp:
+        xs: list[str] = []
+        ys: list[float] = []
+        for model in models:
+            sub = [row for row in rows if row["model"] == model]
+            grouped = _group_pass_rate(sub)
+            base = grouped.get(("A", 1))
+            mode_keys = sorted([key for key in grouped if key[0] == mode], key=_mode_k_sort_key)
+            if not base or not mode_keys:
                 continue
-            a_rate = grp[a_key][0] / grp[a_key][1] if grp[a_key][1] else 0.0
-            mode_keys = sorted([k for k in grp if k[0] == mode], key=lambda x: x[1])
-            if not mode_keys:
-                continue
-            best_k = mode_keys[-1]
-            p, t = grp[best_k]
-            if t == 0:
-                continue
-            xs.append(m)
-            ys.append((p / t - a_rate) * 100)
+            compared = grouped[mode_keys[-1]]
+            xs.append(model)
+            ys.append((compared[0] / compared[1] - base[0] / base[1]) * 100)
         if xs:
             ax.plot(xs, ys, marker="o", label=f"{mode} - A")
+    ax.axhline(0, color="black", linewidth=0.7)
     ax.set_xlabel("model")
     ax.set_ylabel("delta hidden pass rate (pp)")
-    ax.axhline(0, color="black", linewidth=0.5)
     ax.set_title("Lift from loop vs one-shot, by model")
     ax.legend()
     plt.xticks(rotation=20, ha="right")
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=160)
     plt.close(fig)
 
 
-def plot_per_task_heatmap(rows: list[dict], out_path: Path) -> None:
-    tasks = sorted({r["task_id"] for r in rows})
-    cells: dict[tuple[str, str], str] = {}
-    mode_ks = sorted({(r["mode"], r["k"]) for r in rows}, key=lambda x: (x[0], x[1]))
-    for r in rows:
-        if r.get("passed_hidden") is None:
-            continue
-        col = _label(r["mode"], r["k"])
-        cells[(r["task_id"], col)] = "P" if r["passed_hidden"] else "F"
-    if not cells:
-        return
-    cols = [_label(m, k) for m, k in mode_ks]
-    grid = []
-    for t in tasks:
-        row = []
-        for c in cols:
-            v = cells.get((t, c))
-            row.append(1 if v == "P" else (0 if v == "F" else -1))
-        grid.append(row)
-    fig, ax = plt.subplots(figsize=(max(6, len(cols) * 0.7), max(3, len(tasks) * 0.4)))
-    im = ax.imshow(grid, cmap="RdYlGn", vmin=-1, vmax=1, aspect="auto")
-    ax.set_xticks(range(len(cols)))
-    ax.set_xticklabels(cols, rotation=30, ha="right")
-    ax.set_yticks(range(len(tasks)))
-    ax.set_yticklabels(tasks)
-    for i, t in enumerate(tasks):
-        for j, c in enumerate(cols):
-            v = cells.get((t, c))
-            if v is not None:
-                ax.text(j, i, v, ha="center", va="center", fontsize=8, color="black")
-    ax.set_title("Per-task outcomes (P=hidden pass, F=fail, blank=not run)")
-    plt.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
+def _coverage_by_mode_k(rows: list[dict]) -> dict[str, dict[str, int]]:
+    grouped: dict[tuple[str, int], dict[str, int]] = defaultdict(
+        lambda: {"rows": 0, "scored": 0, "passed": 0, "failed": 0, "unscored": 0}
+    )
+    for row in rows:
+        key = (row["mode"], int(row["k"]))
+        grouped[key]["rows"] += 1
+        if row.get("passed_hidden") is None:
+            grouped[key]["unscored"] += 1
+        else:
+            grouped[key]["scored"] += 1
+            if row.get("passed_hidden") is True:
+                grouped[key]["passed"] += 1
+            else:
+                grouped[key]["failed"] += 1
+    return {
+        _label(*key): grouped[key]
+        for key in sorted(grouped, key=_mode_k_sort_key)
+    }
+
+
+def _coverage_by_model_mode_k(rows: list[dict]) -> dict[str, dict[str, int]]:
+    grouped: dict[tuple[str, str, int], dict[str, int]] = defaultdict(
+        lambda: {"rows": 0, "scored": 0, "passed": 0, "failed": 0, "unscored": 0}
+    )
+    for row in rows:
+        key = (row["model"], row["mode"], int(row["k"]))
+        grouped[key]["rows"] += 1
+        if row.get("passed_hidden") is None:
+            grouped[key]["unscored"] += 1
+        else:
+            grouped[key]["scored"] += 1
+            if row.get("passed_hidden") is True:
+                grouped[key]["passed"] += 1
+            else:
+                grouped[key]["failed"] += 1
+    return {
+        f"{model} | {_label(mode, k)}": grouped[key]
+        for key in sorted(grouped, key=_model_mode_k_sort_key)
+        for model, mode, k in [key]
+    }
 
 
 def make_all(
@@ -578,48 +727,59 @@ def make_all(
     out_dir: Path,
     model: str | None = None,
     batch_tag: str | None = None,
+    seed: int | None = None,
 ) -> list[Path]:
-    rows = load(jsonl_path)
-    rows = filter_rows(rows, model=model, batch_tag=batch_tag)
+    raw_rows = _filter_raw_rows(load(jsonl_path), model=model, batch_tag=batch_tag, seed=seed)
+    rows = _latest_rows_by_run_key(raw_rows)
     if not rows:
         return []
     out_dir.mkdir(parents=True, exist_ok=True)
-    plots = []
-    funcs = [
+
+    for old_png in out_dir.glob("*.png"):
+        old_png.unlink()
+
+    plots: list[Path] = []
+    funcs: list[tuple[str, Callable[[list[dict], Path], None]]] = [
         ("pass_rate_by_mode_k.png", plot_pass_rate_by_mode_k),
-        ("baseline_vs_tests.png", plot_baseline_vs_tests),
-        ("baseline_vs_self_tests.png", plot_baseline_vs_self_tests),
-        ("baseline_vs_separate_self_tests.png", plot_baseline_vs_separate_self_tests),
-        ("baseline_vs_dual_self_tests.png", plot_baseline_vs_dual_self_tests),
-        ("baseline_vs_validated_self_tests.png", plot_baseline_vs_validated_self_tests),
-        ("pass_rate_vs_iterations.png", plot_pass_rate_vs_iterations),
+        ("pass_rate_by_model_mode_k.png", plot_pass_rate_by_model_mode_k),
+        ("failure_count_by_mode.png", plot_failure_count_by_mode),
         ("repair_outcomes.png", plot_repair_outcomes),
+        ("self_test_confusion_by_mode.png", plot_self_test_confusion),
         ("overfit_rate_by_mode.png", plot_overfit_rate),
         ("tokens_vs_pass.png", plot_tokens_vs_pass),
+        ("remaining_failures_heatmap.png", plot_remaining_failures_heatmap),
+        ("pass_rate_vs_iterations.png", plot_pass_rate_vs_iterations),
         ("delta_by_model_size.png", plot_delta_by_model_size),
-        ("per_task_heatmap.png", plot_per_task_heatmap),
     ]
     for name, fn in funcs:
-        p = out_dir / name
-        fn(rows, p)
-        if p.exists():
-            plots.append(p)
+        path = out_dir / name
+        fn(rows, path)
+        if path.exists():
+            plots.append(path)
 
-    # Write a summary.json so the batch dir is self-describing.
+    rerun_path = out_dir / "rerun_gain_by_mode.png"
+    plot_rerun_gain_by_mode(raw_rows, rerun_path)
+    if rerun_path.exists():
+        plots.append(rerun_path)
+
     repair_counts: dict[str, int] = defaultdict(int)
     for row in rows:
         bucket = _repair_bucket(row)
         if bucket is not None:
             repair_counts[bucket] += 1
     summary = {
+        "raw_rows": len(raw_rows),
         "n_rows": len(rows),
         "model_filter": model,
+        "seed_filter": seed,
         "batch_tag": batch_tag,
-        "models": sorted({r["model"] for r in rows}),
-        "tasks": sorted({r["task_id"] for r in rows}),
-        "modes": sorted({r["mode"] for r in rows}),
-        "ks": sorted({r["k"] for r in rows}),
-        "hidden_pass_count": sum(1 for r in rows if r.get("passed_hidden")),
+        "models": sorted({row["model"] for row in rows}),
+        "tasks": sorted({row["task_id"] for row in rows}, key=_task_sort_key),
+        "modes": sorted({row["mode"] for row in rows}, key=lambda mode: MODE_ORDER.get(mode, 99)),
+        "ks": sorted({row["k"] for row in rows}),
+        "coverage_by_mode_k": _coverage_by_mode_k(rows),
+        "coverage_by_model_mode_k": _coverage_by_model_mode_k(rows),
+        "hidden_pass_count": sum(1 for row in rows if row.get("passed_hidden") is True),
         "repair_counts": dict(sorted(repair_counts.items())),
         "ablation": build_ablation_summary(rows),
     }
@@ -637,21 +797,22 @@ def default_batch_tag() -> str:
 def main() -> int:
     import argparse
 
-    p = argparse.ArgumentParser()
-    p.add_argument("--log", default="results/runs.jsonl")
-    p.add_argument("--out", default=None, help="output dir; defaults to results/plots/<timestamp>")
-    p.add_argument("--model", default=None, help="filter to one model")
-    p.add_argument("--batch-tag", default=None, help="filter to one batch tag")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--log", default="results/runs.jsonl")
+    parser.add_argument("--out", default=None, help="output dir; defaults to results/plots/<timestamp>")
+    parser.add_argument("--model", default=None, help="filter to one model")
+    parser.add_argument("--batch-tag", default=None, help="filter to one batch tag")
+    parser.add_argument("--seed", type=int, default=None, help="filter to one seed")
+    args = parser.parse_args()
 
     out_dir = Path(args.out) if args.out else Path("results/plots") / default_batch_tag()
-    plots = make_all(Path(args.log), out_dir, model=args.model, batch_tag=args.batch_tag)
+    plots = make_all(Path(args.log), out_dir, model=args.model, batch_tag=args.batch_tag, seed=args.seed)
     if not plots:
         print("no data to plot")
         return 1
     print(f"wrote {len(plots)} plots to {out_dir}")
-    for p_ in plots:
-        print(f"  {p_}")
+    for plot in plots:
+        print(f"  {plot}")
     return 0
 
 

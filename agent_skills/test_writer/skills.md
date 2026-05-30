@@ -23,6 +23,9 @@ Test design rules:
 - For ordered outputs, include a reversed-input case and assert the required canonical output order.
 - For performance-sensitive prompts, include one modest larger case with a manually derived expected value.
 - For tasks about digits, test the digit domain itself rather than a huge numeric interval.
+- Include one cheap stress case when the prompt has a large numeric bound, large `k`, graph/path search, recursion, or repeated movement. The test should finish quickly for the intended algorithm and expose brute-force enumeration or full-range scans.
+- For digit-between-bounds tasks, include a very large bound case such as one endpoint far above `9`; the expected output must still contain only even single digits.
+- For path tasks where revisiting cells is allowed, include a small grid with a larger `k` and a manually derived repeated pattern to catch exhaustive DFS/path enumeration.
 - Do not copy or depend on hidden tests.
 - Do not test implementation details.
 - Avoid slow, random, network, filesystem, or environment-dependent tests.

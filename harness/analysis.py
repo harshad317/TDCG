@@ -76,6 +76,7 @@ def paired_ablation(rows: list[dict]) -> dict[str, Any]:
         row
         for row in scored
         if row.get("mode") in ("C", "D", "D_sep", "D_dual", "D_val", "E", "P_select")
+        or str(row.get("mode", "")).startswith("X_")
     ]
     for row in compared_rows:
         base = baseline.get(_row_key(row))

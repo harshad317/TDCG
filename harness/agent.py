@@ -1913,6 +1913,9 @@ def _run_task_dual(
         repair_candidate_model_error_count = 0
         repair_model_error_count = 0
         repair_model_timeout_count = 0
+        repair_fallback_to_code_count = 0
+        repair_fallback_to_code_error_count = 0
+        repair_fallback_to_code_timeout_count = 0
         repair_aborted_after_model_error = False
         repair_preserved_solution_count = 0
         repair_model_errors: list[str] = []
@@ -2675,11 +2678,23 @@ def _run_task_dual(
                 repair_model_errors.append(repair_error)
                 if _is_timeout_error(e):
                     repair_model_timeout_count += 1
-                repair_aborted_after_model_error = True
-                repair_preserved_solution_count += 1
-                stop_future_repairs_after_model_error = cfg.abort_repair_on_model_error
-                sandbox.write("solution.py", solution)
-                break
+                repair_reply = None
+                if repair_client is not code_client:
+                    try:
+                        repair_reply = code_client.chat(code_messages)
+                        repair_fallback_to_code_count += 1
+                    except Exception as fallback_e:
+                        fallback_error = _model_error(fallback_e, "repair_fallback")
+                        repair_fallback_to_code_error_count += 1
+                        repair_model_errors.append(fallback_error)
+                        if _is_timeout_error(fallback_e):
+                            repair_fallback_to_code_timeout_count += 1
+                if repair_reply is None:
+                    repair_aborted_after_model_error = True
+                    repair_preserved_solution_count += 1
+                    stop_future_repairs_after_model_error = cfg.abort_repair_on_model_error
+                    sandbox.write("solution.py", solution)
+                    break
             code_tokens_in += repair_reply.tokens_in
             code_tokens_out += repair_reply.tokens_out
             repair_tokens_in += repair_reply.tokens_in
@@ -2760,9 +2775,21 @@ def _run_task_dual(
                     repair_model_errors.append(repair_error)
                     if _is_timeout_error(e):
                         repair_model_timeout_count += 1
-                    repair_aborted_after_model_error = True
-                    stop_future_repairs_after_model_error = cfg.abort_repair_on_model_error
-                    break
+                    repair_retry_reply = None
+                    if repair_client is not code_client:
+                        try:
+                            repair_retry_reply = code_client.chat(retry_messages)
+                            repair_fallback_to_code_count += 1
+                        except Exception as fallback_e:
+                            fallback_error = _model_error(fallback_e, "repair_fallback")
+                            repair_fallback_to_code_error_count += 1
+                            repair_model_errors.append(fallback_error)
+                            if _is_timeout_error(fallback_e):
+                                repair_fallback_to_code_timeout_count += 1
+                    if repair_retry_reply is None:
+                        repair_aborted_after_model_error = True
+                        stop_future_repairs_after_model_error = cfg.abort_repair_on_model_error
+                        break
                 code_repair_retry_count += 1
                 code_tokens_in += repair_retry_reply.tokens_in
                 code_tokens_out += repair_retry_reply.tokens_out
@@ -2848,6 +2875,9 @@ def _run_task_dual(
         record.extra["repair_candidate_model_error_count"] = repair_candidate_model_error_count
         record.extra["repair_model_error_count"] = repair_model_error_count
         record.extra["repair_model_timeout_count"] = repair_model_timeout_count
+        record.extra["repair_fallback_to_code_count"] = repair_fallback_to_code_count
+        record.extra["repair_fallback_to_code_error_count"] = repair_fallback_to_code_error_count
+        record.extra["repair_fallback_to_code_timeout_count"] = repair_fallback_to_code_timeout_count
         record.extra["repair_aborted_after_model_error"] = repair_aborted_after_model_error
         record.extra["repair_preserved_solution_count"] = repair_preserved_solution_count
         record.extra["repair_model_errors"] = repair_model_errors[:5]

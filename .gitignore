@@ -9,4 +9,5 @@ results/*.jsonl
 results/*.console.log
 results/plots/
 results/artifacts/
+results/external_artifacts/
 tasks_bench/

@@ -21,6 +21,8 @@ Validation rules:
 - Use `solution.py` only to spot tautologies or implementation-detail tests; never treat it as the source of truth.
 - For ordered outputs, verify the exact order required by the prompt.
 - For mutation-sensitive prompts, reject tests that ignore required non-mutation behavior only when the rest of the suite has no meaningful oracle coverage.
+- Approve cheap stress tests when their expected values are manually derivable from the prompt. These are especially valuable for large numeric bounds, digit-domain tasks, repeated path movement, and algorithms that should not enumerate an exponential search space.
+- Reject stress tests only because they are slow if the test itself requires huge computation; a large input with a tiny fixed expected result is valid when the prompt's intended domain requires it.
 
 Output rules:
 - Output exactly two lines.

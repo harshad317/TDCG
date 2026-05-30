@@ -19,6 +19,7 @@ from pathlib import Path
 
 from harness.agent import AgentConfig, run_task
 from harness.analysis import build_ablation_summary, format_ablation_summary
+from harness import external_agents as external_runner
 from harness.log import JsonlLogger, RunRecord
 from harness.models import build_client
 from harness.plot import default_batch_tag, filter_rows, load, make_all
@@ -163,6 +164,13 @@ def format_work_prefix(item: WorkItem) -> str:
     )
 
 
+def format_external_work_prefix(item: external_runner.WorkItem) -> str:
+    return (
+        f"[X{item.index}] model={item.model} seed={item.seed} "
+        f"task={item.task_dir.name} agent={item.agent} ... "
+    )
+
+
 def build_work_items(tasks: list[Path], modes: list[str], ks: list[int], seeds: list[int]) -> list[WorkItem]:
     items: list[WorkItem] = []
     total = 0
@@ -185,6 +193,7 @@ def load_completed_work_keys(
     *,
     batch_tag: str,
     model: str,
+    passed_only: bool = False,
 ) -> tuple[set[tuple[str, str, int, int]], int]:
     completed: set[tuple[str, str, int, int]] = set()
     invalid_rows = 0
@@ -205,6 +214,8 @@ def load_completed_work_keys(
                 continue
             extra = row.get("extra") or {}
             if extra.get("batch_tag") != batch_tag:
+                continue
+            if passed_only and row.get("passed_hidden") is not True:
                 continue
             try:
                 completed.add((
@@ -336,6 +347,115 @@ def execute_work_item(
     return record
 
 
+def execute_external_agents(
+    args,
+    *,
+    tasks: list[Path],
+    seeds: list[int],
+    batch_tag: str,
+    logger: JsonlLogger,
+) -> None:
+    agents = parse_csv_str(args.agents)
+    if not agents:
+        return
+    unknown_agents = [agent for agent in agents if agent not in external_runner.AGENT_MODES]
+    if unknown_agents:
+        raise SystemExit(f"unknown agents: {', '.join(unknown_agents)}")
+    if args.agent_jobs < 1:
+        raise SystemExit("--agent-jobs must be >= 1")
+
+    external_args = argparse.Namespace(
+        agent_timeout=args.agent_timeout or args.model_timeout,
+        artifact_root=args.artifact_root,
+        claude_command=args.claude_command,
+        claude_permission_mode=args.claude_permission_mode,
+        codex_command=args.codex_command,
+        dry_run=args.dry_run,
+        hidden_timeout=args.hidden_timeout,
+        max_turns=args.agent_max_turns,
+        pytest_timeout=args.pytest_timeout,
+        save_artifacts=args.save_artifacts,
+        stdout_code_fallback=args.stdout_code_fallback,
+    )
+    work_items = external_runner.build_work_items(
+        tasks,
+        agents,
+        seeds,
+        [args.model],
+    )
+    total_work_items = len(work_items)
+    if args.resume or args.resume_log:
+        resume_log = Path(args.resume_log or args.log)
+        completed, invalid_rows = external_runner.load_completed_work_keys(
+            resume_log,
+            batch_tag=batch_tag,
+            models={args.model},
+            passed_only=args.rerun_failed,
+        )
+        work_items = [
+            item
+            for item in work_items
+            if external_runner.work_key(item) not in completed
+        ]
+        skipped = total_work_items - len(work_items)
+        print(
+            f"external resume: skipped {skipped}/{total_work_items} completed cases "
+            f"from {resume_log}"
+            + (" (passed rows only)" if args.rerun_failed else "")
+        )
+        if invalid_rows:
+            print(
+                f"external resume: ignored {invalid_rows} malformed rows in {resume_log}",
+                file=sys.stderr,
+            )
+
+    if not work_items:
+        return
+
+    if args.agent_jobs == 1:
+        for item in work_items:
+            print(format_external_work_prefix(item), end="", flush=True)
+            record = external_runner.run_external_agent(item, external_args, batch_tag)
+            if not args.dry_run:
+                logger.write(record)
+            print("dry" if args.dry_run else external_runner.format_record_result(record))
+        return
+
+    print(
+        f"running {len(work_items)} external-agent cases with {args.agent_jobs} workers "
+        f"(agent timeout {external_args.agent_timeout}s)"
+    )
+    with ThreadPoolExecutor(max_workers=args.agent_jobs) as executor:
+        futures = {
+            executor.submit(
+                external_runner.run_external_agent,
+                item,
+                external_args,
+                batch_tag,
+            ): item
+            for item in work_items
+        }
+        for future in as_completed(futures):
+            item = futures[future]
+            try:
+                record = future.result()
+            except Exception as e:
+                record = RunRecord(
+                    task_id=item.task_dir.name,
+                    model=item.model,
+                    mode=external_runner.AGENT_MODES[item.agent],
+                    k=1,
+                    seed=item.seed,
+                    passed_hidden=False,
+                    final_error_type=f"harness_error:{type(e).__name__}:{e}",
+                    extra={"batch_tag": batch_tag, "external_agent": item.agent},
+                )
+            if not args.dry_run:
+                logger.write(record)
+            status = "dry" if args.dry_run else external_runner.format_record_result(record)
+            print(format_external_work_prefix(item) + status, flush=True)
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True, help="code model id, e.g. qwen2.5-coder:1.5b")
@@ -359,6 +479,23 @@ def main() -> int:
                    help="only run the first N tasks (after natural/numeric sorting)")
     p.add_argument("--modes", default="A,C", help="comma-separated modes: A,B,C,D,D_sep,D_dual,D_val,E")
     p.add_argument("--ks", default="1,3,5", help="comma-separated k values; A/B forced to k=1")
+    p.add_argument("--agents", default="",
+                   help="comma-separated external agents to run after native modes: codex,claude")
+    p.add_argument("--agent-jobs", type=int, default=1,
+                   help="parallel worker count for external agents; keep at 1 for local Ollama unless capacity is isolated")
+    p.add_argument("--agent-timeout", type=int, default=None,
+                   help="wall-clock timeout for each external agent case; defaults to --model-timeout")
+    p.add_argument("--agent-max-turns", type=int, default=20,
+                   help="max turns passed to external agent CLIs")
+    p.add_argument("--codex-command", choices=["ollama-launch", "direct"], default="direct",
+                   help="Codex external-agent launcher")
+    p.add_argument("--claude-command", choices=["ollama-launch", "direct"], default="ollama-launch",
+                   help="Claude Code external-agent launcher")
+    p.add_argument("--claude-permission-mode", default="bypassPermissions",
+                   help="passed to Claude Code --permission-mode; external agents run in isolated workspaces")
+    p.add_argument("--no-stdout-code-fallback", dest="stdout_code_fallback", action="store_false",
+                   help="disable parsing a final fenced Python block when external agents fail to edit solution.py")
+    p.set_defaults(stdout_code_fallback=True)
     p.add_argument("--max-bash-calls", type=int, default=20)
     p.add_argument("--pytest-timeout", type=int, default=10,
                    help="timeout for visible public/self pytest feedback runs")
@@ -399,6 +536,8 @@ def main() -> int:
     p.add_argument("--log", default="results/runs.jsonl")
     p.add_argument("--resume", action="store_true",
                    help="skip task/mode/k/seed rows already present in --log for this batch tag and model")
+    p.add_argument("--rerun-failed", action="store_true",
+                   help="with --resume, only skip rows whose hidden score already passed; failed/timeout/error rows are rerun")
     p.add_argument("--resume-log", default=None,
                    help="JSONL file to read completed rows from; implies --resume and defaults to --log")
     p.add_argument("--dry-run", action="store_true", help="skip model calls, just verify wiring")
@@ -408,6 +547,12 @@ def main() -> int:
     args = p.parse_args()
     if args.jobs < 1:
         raise SystemExit("--jobs must be >= 1")
+    if args.agent_jobs < 1:
+        raise SystemExit("--agent-jobs must be >= 1")
+    if args.agent_timeout is not None and args.agent_timeout < 1:
+        raise SystemExit("--agent-timeout must be >= 1")
+    if args.agent_max_turns < 1:
+        raise SystemExit("--agent-max-turns must be >= 1")
     if args.cheap_dval:
         args.self_test_candidates = 1
         args.code_candidates = 1
@@ -452,12 +597,14 @@ def main() -> int:
             resume_log,
             batch_tag=batch_tag,
             model=args.model,
+            passed_only=args.rerun_failed,
         )
         work_items = [item for item in work_items if work_key(item) not in completed]
         skipped = total_work_items - len(work_items)
         print(
             f"resume: skipped {skipped}/{total_work_items} completed cases "
             f"from {resume_log}"
+            + (" (passed rows only)" if args.rerun_failed else "")
         )
         if invalid_rows:
             print(
@@ -476,7 +623,8 @@ def main() -> int:
                 repair_model,
                 repair_model_timeout,
             )
-            logger.write(record)
+            if not args.dry_run:
+                logger.write(record)
             print("dry" if args.dry_run else format_record_result(record))
     else:
         print(
@@ -516,9 +664,18 @@ def main() -> int:
                         repair_model_timeout,
                     )
                     record.final_error_type = f"harness_error:{type(e).__name__}:{e}"
-                logger.write(record)
+                if not args.dry_run:
+                    logger.write(record)
                 status = "dry" if args.dry_run else format_record_result(record)
                 print(format_work_prefix(item) + status, flush=True)
+
+    execute_external_agents(
+        args,
+        tasks=tasks,
+        seeds=seeds,
+        batch_tag=batch_tag,
+        logger=logger,
+    )
 
     if not args.dry_run:
         rows = filter_rows(load(Path(args.log)), batch_tag=batch_tag)

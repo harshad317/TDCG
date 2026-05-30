@@ -5,6 +5,14 @@ Hypothesis: small coding models become much more effective when wrapped in a
 test-execution-repair loop. We measure how much of agentic coding performance
 comes from execution feedback vs raw one-shot model intelligence.
 
+## How it works
+
+![TDCG test-repair loop](docs/images/tdcg_test_repair_loop.svg)
+
+The model only sees the task prompt, starter code, and visible test feedback.
+Hidden tests are scored later in an isolated directory, so the benchmark can
+measure whether visible feedback actually improves generalization.
+
 ## Modes
 | Mode | Tests              | Execution | Measures                          |
 |------|--------------------|-----------|-----------------------------------|
@@ -31,6 +39,21 @@ D_val - D_dual = test-validation value
 E - C = marginal value of model-written tests on top of public
 ```
 
+## Result snapshot
+
+HumanEval+ full run, `qwen2.5-coder:7b`, batch `humaneval_plus_full_v3`.
+The headline comparison is one-shot code generation versus public-test repair
+and validated self-test repair.
+
+![Hidden test pass rate by mode](docs/images/humaneval_plus_full_v3_pass_rate_by_mode_k.png)
+
+![No tests vs validated self-test loop](docs/images/humaneval_plus_full_v3_validated_self_test_lift.png)
+
+The repair trace is the guardrail: it separates real hidden-failure repairs
+from solutions that already passed before self-test feedback.
+
+![Self-test feedback repair outcomes](docs/images/humaneval_plus_full_v3_repair_outcomes.png)
+
 ## Layout
 ```
 tasks/
@@ -45,6 +68,7 @@ harness/
   sandbox.py            # tempdir + subprocess pytest
   models.py             # Ollama client
   agent.py              # per-mode prompts + iteration loop
+  external_agents.py    # Codex/Claude Code CLI benchmark bridge
   log.py                # JSONL records
   plot.py               # matplotlib plots from JSONL
 run.py                  # CLI
@@ -58,23 +82,122 @@ Every `run.py` invocation tags rows with `batch_tag` (default = timestamp) and
 saves PNGs to `results/plots/<batch_tag>/`:
 
 - `pass_rate_by_mode_k.png` — bar chart, hidden pass rate per (mode, k)
-- `baseline_vs_tests.png` — headline comparison: no tests (A/k=1) vs public-test feedback (C/k=max)
-- `baseline_vs_self_tests.png` — headline comparison: no tests (A/k=1) vs model-written self-test loop (D/k=max)
-- `baseline_vs_separate_self_tests.png` — headline comparison: no tests (A/k=1) vs separated self-test loop (D_sep/k=max)
-- `baseline_vs_dual_self_tests.png` — headline comparison: no tests (A/k=1) vs two-model self-test loop (D_dual/k=max)
-- `baseline_vs_validated_self_tests.png` — headline comparison: no tests (A/k=1) vs validated self-test loop (D_val/k=max)
-- `pass_rate_vs_iterations.png` — k-sweep line plot
+- `failure_count_by_mode.png` — hidden pass/fail/timeout/unscored counts
 - `repair_outcomes.png` — when `--score-hidden-each-iter` is enabled, counts hidden-fail→hidden-pass repairs
+- `self_test_confusion_by_mode.png` — self-test signal vs hidden outcome
 - `overfit_rate_by_mode.png` — visible pass + hidden fail (kill metric)
 - `tokens_vs_pass.png` — compute spent vs outcome
+- `remaining_failures_heatmap.png` — unresolved tasks across the main modes
+- `rerun_gain_by_mode.png` — first-vs-latest row gains in append-only logs
+- `pass_rate_vs_iterations.png` — only when a complete comparable k-sweep exists
 - `delta_by_model_size.png` — only when JSONL has ≥2 models
-- `per_task_heatmap.png` — task × mode/k grid
 - `summary.json` — counts + filter info
 - `ablation_summary.json` — paired A-vs-test outcomes plus self-test/hidden confusion matrix
 
 Regenerate anytime: `python -m harness.plot --batch-tag <tag>`
 Across all batches: `python -m harness.plot --out results/plots/all`
 Skip auto-plot: `--no-plot`
+
+## External coding-agent baselines
+
+Use `harness.external_agents` to benchmark Codex CLI and Claude Code through
+Ollama on the same tasks and hidden scorer. The agent sees only `prompt.md`,
+`public_tests.py`, `solution.py`, `AGENTS.md`, and `CLAUDE.md`; hidden tests are
+scored after the agent exits.
+
+Example best-effort external-agent baseline on a 20-task HumanEval+ slice:
+
+![External coding-agent hidden pass rate](docs/images/humaneval_plus_external_agents_best_effort_v2_pass_rate.png)
+
+Install/configure the external tools first:
+
+```bash
+npm install -g @openai/codex
+curl -fsSL https://claude.ai/install.sh | bash
+ollama pull qwen2.5-coder:7b
+```
+
+Smoke-test one task:
+
+```bash
+python -m harness.external_agents \
+  --model qwen2.5-coder:7b \
+  --agents codex,claude \
+  --benchmark humaneval_plus \
+  --limit 1 \
+  --jobs 1 \
+  --agent-timeout 600 \
+  --hidden-timeout 600 \
+  --save-artifacts \
+  --log results/humaneval_plus_external_agents_smoke.jsonl \
+  --batch-tag humaneval_plus_external_agents_smoke
+```
+
+Benchmark every local Ollama model against both external agents:
+
+```bash
+python -m harness.external_agents \
+  --models-from-ollama \
+  --agents codex,claude \
+  --benchmark humaneval_plus \
+  --limit 20 \
+  --jobs 1 \
+  --agent-timeout 600 \
+  --hidden-timeout 600 \
+  --save-artifacts \
+  --log results/humaneval_plus_external_agents_all_models_v1.jsonl \
+  --batch-tag humaneval_plus_external_agents_all_models_v1
+```
+
+Use `--models model_a,model_b` when you want an explicit subset. Keep
+`--jobs 1` for local Ollama comparisons unless you have enough separate model
+serving capacity; high concurrency turns agent quality into queueing noise.
+
+You can also append external-agent baselines directly from `run.py` with
+`--agents codex,claude`. In that integrated mode, `--jobs` controls the native
+harness modes and `--agent-jobs` controls Codex/Claude cases separately
+(`--agent-jobs` defaults to 1 for local Ollama stability).
+
+Run a surgical hard-task comparison:
+
+```bash
+python -m harness.external_agents \
+  --model qwen2.5-coder:7b \
+  --agents codex,claude \
+  --tasks \
+    tasks_bench/humaneval_plus/HumanEval_32 \
+    tasks_bench/humaneval_plus/HumanEval_86 \
+    tasks_bench/humaneval_plus/HumanEval_91 \
+    tasks_bench/humaneval_plus/HumanEval_115 \
+    tasks_bench/humaneval_plus/HumanEval_124 \
+    tasks_bench/humaneval_plus/HumanEval_130 \
+    tasks_bench/humaneval_plus/HumanEval_132 \
+    tasks_bench/humaneval_plus/HumanEval_142 \
+    tasks_bench/humaneval_plus/HumanEval_145 \
+    tasks_bench/humaneval_plus/HumanEval_146 \
+    tasks_bench/humaneval_plus/HumanEval_147 \
+    tasks_bench/humaneval_plus/HumanEval_158 \
+    tasks_bench/humaneval_plus/HumanEval_159 \
+    tasks_bench/humaneval_plus/HumanEval_163 \
+  --jobs 1 \
+  --agent-timeout 600 \
+  --hidden-timeout 600 \
+  --save-artifacts \
+  --log results/humaneval_plus_external_agents_hard14.jsonl \
+  --batch-tag humaneval_plus_external_agents_hard14
+```
+
+By default Codex uses direct `codex exec --oss --local-provider ollama`, while
+Claude Code uses `ollama launch claude`. You can switch Codex to Ollama's
+launcher with `--codex-command ollama-launch` or switch Claude to direct CLI
+invocation with `--claude-command direct`.
+
+Local OSS models do not always drive the Codex/Claude editing tools correctly.
+For that case, the runner accepts a final fenced Python block from stdout and
+writes it to `solution.py`, recording `stdout_code_fallback_used=true`. Add
+`--no-stdout-code-fallback` for a stricter pure tool-use comparison. If strict
+mode leaves `solution.py` untouched, the run is reported as `agent_no_edit`;
+that measures tool-use compatibility, not Python problem-solving ability.
 
 ## Quick start
 
@@ -187,6 +310,11 @@ python run.py \
   --log results/humaneval_plus_full_v3.jsonl \
   --batch-tag humaneval_plus_full_v3 \
   --resume
+
+# If you change timeouts, prompts, candidates, or repair behavior, keep the same
+# append-only log but rerun stale failures instead of letting --resume skip them:
+# add --rerun-failed. Plots and summaries deduplicate by task/mode/k/seed and
+# keep the latest row for each run key.
 
 # Cheaper D_val profile for cost/timeout-control experiments. This keeps the
 # same A/C/D_val comparison shape but uses one self-test suite, one code

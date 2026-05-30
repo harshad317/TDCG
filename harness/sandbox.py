@@ -13,6 +13,17 @@ from pathlib import Path
 SANDBOX_FILES = ["prompt.md", "solution.py", "public_tests.py"]
 DEFAULT_CMD_TIMEOUT = 10
 
+_MALLOC_KEYS = {"MallocStackLogging", "MallocStackLoggingNoCompact",
+                "MallocStackLoggingDontDeleteStackLogFile"}
+
+def _clean_env() -> dict[str, str]:
+    """Build a subprocess env that suppresses macOS MallocStackLogging warnings."""
+    env = {k: v for k, v in os.environ.items() if k not in _MALLOC_KEYS}
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONINTMAXSTRDIGITS"] = "0"
+    env["PYTHONHASHSEED"] = "0"
+    return env
+
 
 @dataclass
 class RunResult:
@@ -59,12 +70,7 @@ class Sandbox:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                env={
-                    **os.environ,
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                    "PYTHONINTMAXSTRDIGITS": "0",
-                    "PYTHONHASHSEED": "0",
-                },
+                env=_clean_env(),
             )
             return RunResult(proc.returncode, proc.stdout, proc.stderr, False)
         except subprocess.TimeoutExpired as e:
