@@ -1,5 +1,6 @@
 pytest>=8
 matplotlib>=3.7
+plotly>=5.0
 # Phase-1 benchmark loaders
 evalplus>=0.3
 datasets>=2.18

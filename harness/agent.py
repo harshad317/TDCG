@@ -902,6 +902,10 @@ UNSAFE_TEST_CALLS = {
     "open",
     "quit",
 }
+# Imports that are normally unsafe but are required to drive script-style
+# (stdin/stdout) tasks, where the only way to exercise solution.py is to run it
+# as a subprocess. Allowed only for tasks detected as script-style.
+SCRIPT_MODE_EXTRA_SAFE_IMPORTS = {"subprocess", "pathlib"}
 
 
 def _target_symbols_from_public_tests(task_dir: Path) -> set[str]:
@@ -920,6 +924,33 @@ def _target_symbols_from_public_tests(task_dir: Path) -> set[str]:
                 if alias.name != "*":
                     symbols.add(alias.asname or alias.name)
     return symbols
+
+
+def _task_is_script_style(task_dir: Path) -> bool:
+    """True when public_tests.py drives solution.py as a subprocess (stdin/stdout)
+    rather than importing a symbol from it.
+
+    Such tasks (e.g. LiveCodeBench competitive-programming problems) expose no
+    importable entry point, so valid tests must run the script via subprocess.
+    """
+    public_tests = task_dir / "public_tests.py"
+    if not public_tests.exists():
+        return False
+    try:
+        tree = ast.parse(public_tests.read_text())
+    except (OSError, SyntaxError):
+        return False
+    # If the public tests import a symbol from solution, it is import-style.
+    if _target_symbols_from_public_tests(task_dir):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".", 1)[0] == "subprocess" for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".", 1)[0] == "subprocess":
+                return True
+    return False
 
 
 def _static_self_test_rejection_reason(task_dir: Path, self_tests: str) -> str | None:
@@ -944,6 +975,8 @@ def _static_self_test_rejection_reason(task_dir: Path, self_tests: str) -> str |
     called_names: set[str] = set()
     attribute_calls: set[tuple[str, str]] = set()
     target_symbols = _target_symbols_from_public_tests(task_dir)
+    script_style = _task_is_script_style(task_dir)
+    allowed_extra = SCRIPT_MODE_EXTRA_SAFE_IMPORTS if script_style else set()
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -972,13 +1005,18 @@ def _static_self_test_rejection_reason(task_dir: Path, self_tests: str) -> str |
                 if isinstance(base, ast.Name):
                     attribute_calls.add((base.id, func.attr))
 
-    unsafe_imports = sorted(module for module in imported_modules if module in UNSAFE_TEST_IMPORTS)
+    unsafe_imports = sorted(
+        module for module in imported_modules
+        if module in UNSAFE_TEST_IMPORTS and module not in allowed_extra
+    )
     if unsafe_imports:
         return "self_tests.py imports unsafe modules: " + ", ".join(unsafe_imports)
 
     unknown_imports = sorted(
         module for module in imported_modules
-        if module not in SAFE_TEST_IMPORTS and module not in UNSAFE_TEST_IMPORTS
+        if module not in SAFE_TEST_IMPORTS
+        and module not in UNSAFE_TEST_IMPORTS
+        and module not in allowed_extra
     )
     if unknown_imports:
         return "self_tests.py imports unsupported modules: " + ", ".join(unknown_imports)
@@ -999,6 +1037,11 @@ def _static_self_test_rejection_reason(task_dir: Path, self_tests: str) -> str |
                 "self_tests.py does not import or call the benchmark entry point(s): "
                 + ", ".join(sorted(target_symbols))
             )
+    elif script_style:
+        # Script-style tasks expose no importable entry point; tests exercise
+        # solution.py by running it as a subprocess, so the import requirement
+        # does not apply.
+        return None
     elif not target_call_names and not imports_solution_module:
         return "self_tests.py must import the public function/class from solution.py."
 
@@ -2230,39 +2273,35 @@ def _run_task_dual(
                     sandbox.write("self_tests.py", _expand_self_test_assertions(fallback_self_tests))
                     self_tests_present = True
                     self_tests_fallback_used = True
-                    fallback_static_reason = _static_self_test_rejection_reason(
-                        task_dir,
-                        fallback_self_tests,
-                    )
-                    if fallback_static_reason is not None:
+                    # public_tests.py is the benchmark's own trusted harness, so it is
+                    # not subject to the static self-test validator (which targets
+                    # import-style tasks and would reject the subprocess/pathlib that
+                    # script-style benchmarks legitimately require). We still confirm it
+                    # passes a reference_solution.py when one is available.
+                    (
+                        fallback_reference_reason,
+                        reference_self_tests_result,
+                        reference_self_tests_passed,
+                        reference_self_tests_available,
+                    ) = _reference_self_test_rejection_reason(task_dir, sandbox, cfg)
+                    if fallback_reference_reason is not None:
                         validation_reason = (
                             (last_validation_reason + "\n\n") if last_validation_reason else ""
-                        ) + "Fallback public_tests.py was rejected: " + fallback_static_reason
+                        ) + "Fallback public_tests.py failed reference validation:\n" + fallback_reference_reason
                     else:
-                        (
-                            fallback_reference_reason,
-                            reference_self_tests_result,
-                            reference_self_tests_passed,
-                            reference_self_tests_available,
-                        ) = _reference_self_test_rejection_reason(task_dir, sandbox, cfg)
-                        if fallback_reference_reason is not None:
+                        self_tests_validated = True
+                        if reference_self_tests_available:
                             validation_reason = (
-                                (last_validation_reason + "\n\n") if last_validation_reason else ""
-                            ) + "Fallback public_tests.py failed reference validation:\n" + fallback_reference_reason
+                                "Generated self-tests failed validation; fell back to "
+                                "public_tests.py, which passed trusted reference_solution.py."
+                            )
                         else:
-                            self_tests_validated = True
-                            if reference_self_tests_available:
-                                validation_reason = (
-                                    "Generated self-tests failed validation; fell back to "
-                                    "public_tests.py, which passed trusted reference_solution.py."
-                                )
-                            else:
-                                validation_reason = (
-                                    "Generated self-tests failed validation; fell back to "
-                                    "public_tests.py because no reference_solution.py was available."
-                                )
-                            if last_validation_reason:
-                                validation_reason += "\n\nLast generated-test rejection:\n" + last_validation_reason
+                            validation_reason = (
+                                "Generated self-tests failed validation; fell back to "
+                                "public_tests.py because no reference_solution.py was available."
+                            )
+                        if last_validation_reason:
+                            validation_reason += "\n\nLast generated-test rejection:\n" + last_validation_reason
 
             validated_self_test_sources: list[str] = []
             if self_tests_validated and self_tests_present and (sandbox.tmp / "self_tests.py").exists():
@@ -2389,6 +2428,7 @@ def _run_task_dual(
         record.extra["self_test_validation_attempts"] = validation_attempts if cfg.mode == "D_val" else None
         record.extra["self_test_validation_reason"] = validation_reason if cfg.mode == "D_val" else None
         if cfg.mode == "D_val":
+            record.extra["validation_mode"] = "script" if _task_is_script_style(task_dir) else "import"
             record.extra["reference_self_tests_available"] = reference_self_tests_available
             record.extra["reference_self_tests_passed"] = reference_self_tests_passed
             record.extra["self_tests_fallback_used"] = self_tests_fallback_used
