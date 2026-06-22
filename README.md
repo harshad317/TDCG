@@ -411,14 +411,63 @@ python -m harness.load_tbench --limit 20
 Writes thin pointer dirs (`tbench_path.txt`) into `tasks_bench/terminal_bench/`.
 Source assets stay in the official `terminal-bench-core` cache.
 
+### Repo-level D_val_agent runner
+
+`D_val_agent` is the repo-level extension of the validated loop. It copies a
+real repository into an isolated workspace, builds a bounded repo map, asks for
+a multi-step plan, reads selected files, applies multi-file edits, runs visible
+verification commands, reviews the resulting diff, and writes PR-style
+artifacts.
+
+```bash
+python -m harness.repo_agent \
+  --task tasks_bench/swebench_pro/<instance_id> \
+  --repo /path/to/repo-at-base-commit \
+  --model qwen2.5-coder:7b \
+  --validator-model gemma4:e2b \
+  --review-model gemma4:e2b \
+  --verify "python -m pytest" \
+  --max-iterations 3 \
+  --command-timeout 180 \
+  --log results/repo_agent_runs.jsonl \
+  --batch-tag repo_agent_smoke
+```
+
+Task directories may also provide:
+
+- `prompt.md` — the task/request.
+- `repo_agent.json` — optional `{"verification_commands": [...]}`.
+- `checks.sh` — copied into the workspace and runnable as `bash checks.sh`.
+
+Artifacts are written under `results/artifacts/repo_agent/<batch>/<task>/` by
+default:
+
+- `repo_map.md` / `repo_map.json` — intelligent repo scan.
+- `plan.json` — multi-step plan and selected files.
+- `context.md` — files read before editing.
+- `verification_iter_*.json` — visible command results.
+- `prediction.diff` — final patch.
+- `review.md` — code review findings/suggestions.
+- `pr.md` — PR-style summary and verification notes.
+
+Use `--dry-run` to validate repository mapping and artifact plumbing without
+making model calls.
+
+Verification commands can originate from model output, so by default they run on
+the host (trusted tasks/models only). Add `--docker --docker-image <img>` to run
+every verification command inside a container with the workspace mounted and no
+network (`--docker-network`, `--docker-platform` to override). The selected
+sandbox is recorded per run as `extra.verification_sandbox`.
+
 ### Scoring (TODO — wire to official runners)
 
 - SWE-bench / Pro / Live / SWT: invoke
   `python -m swebench.harness.run_evaluation --predictions_path … --dataset_name … --split …`
 - Terminal-Bench: invoke `tb run --task <id> --agent <wrapper>`
 
-Diff-generating agent for these (mode A vs C semantics on patch generation)
-is the next milestone.
+Official scorer integration is still separate: `D_val_agent` produces
+`prediction.diff`; the next milestone is converting those diffs into the
+official SWE-bench/Terminal-Bench prediction formats and invoking their runners.
 
 ## Budget (locked, equal across modes)
 - max iterations: from `--ks`

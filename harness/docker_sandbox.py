@@ -43,13 +43,21 @@ class DockerSandbox:
         env: dict[str, str] | None = None,
         platform: str | None = None,  # "linux/amd64" forced for x86 SWE-bench images on M-series
         network: str = "none",
+        host_dir: Path | str | None = None,
     ):
         self.image = image
         self.workdir = workdir
         self.env = env or {}
         self.platform = platform
         self.network = network
-        self.host_dir = Path(tempfile.mkdtemp(prefix="dockersb_"))
+        if host_dir is not None:
+            # Mount an existing directory (e.g. an agent workspace). We do not own
+            # it, so cleanup() must not delete it.
+            self.host_dir = Path(host_dir).resolve()
+            self._owns_host_dir = False
+        else:
+            self.host_dir = Path(tempfile.mkdtemp(prefix="dockersb_"))
+            self._owns_host_dir = True
         self.container_name = f"codehyp_{uuid.uuid4().hex[:10]}"
 
     # ---- workspace ops (on host, mirrored into container) ----
@@ -117,12 +125,17 @@ class DockerSandbox:
 
     def cleanup(self) -> None:
         # Best-effort container kill (if it survived) and host dir removal.
-        subprocess.run(
-            ["docker", "rm", "-f", self.container_name],
-            capture_output=True,
-            text=True,
-        )
-        shutil.rmtree(self.host_dir, ignore_errors=True)
+        try:
+            subprocess.run(
+                ["docker", "rm", "-f", self.container_name],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            # docker not installed; nothing to clean up on the daemon side.
+            pass
+        if self._owns_host_dir:
+            shutil.rmtree(self.host_dir, ignore_errors=True)
 
 
 def ensure_image(image: str, timeout: int = 600) -> bool:
